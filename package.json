@@ -1,0 +1,49 @@
+{
+  "name": "@agent-sh/orientation",
+  "version": "0.1.0",
+  "description": "Stops AI coding agents from guessing the story of code they didn't write this session. Reconstructs real history (the goal behind code, shipped vs in-flight, coupled files) from Claude Code transcripts, surfaced via the get-oriented skill.",
+  "keywords": [
+    "agent",
+    "claude",
+    "claude-code",
+    "skills",
+    "provenance",
+    "action-graph",
+    "context",
+    "compaction",
+    "ai"
+  ],
+  "homepage": "https://github.com/agent-sh/orientation",
+  "bugs": {
+    "url": "https://github.com/agent-sh/orientation/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/agent-sh/orientation.git"
+  },
+  "license": "MIT OR Apache-2.0",
+  "author": "Avi Fenesh <avifenesh@gmail.com>",
+  "bin": {
+    "orientation": "bin/orientation"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "skill/",
+    "install.js",
+    "projects.txt.example",
+    "README.md"
+  ],
+  "scripts": {
+    "postinstall": "node install.js",
+    "test": "node test/selftest.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ]
+}

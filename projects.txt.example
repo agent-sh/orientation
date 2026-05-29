@@ -1,0 +1,4 @@
+# action-graph allowlist — one cwd PREFIX per line.
+# A prefix matches every project (and nested repo) whose session cwd is under it.
+# Each distinct cwd becomes its own project. Empty/missing = nothing ingested.
+/home/avifenesh/projects
