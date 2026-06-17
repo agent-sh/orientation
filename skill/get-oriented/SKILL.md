@@ -1,68 +1,102 @@
 ---
 name: get-oriented
-description: "Use when judging or planning around code not written this session — 'what's next', 'what's the state', 'is this a bug', 'is this dead', or before deleting or adding near it. Run FIRST, before git status/diffs/README: those show only committed history, but live work is uncommitted and invisible to recon. Trigger on the situation, not on confidence — a clean compile and tidy README hide missing history. After a compact, run even for this-session work: the summary is lossy, pre-compact detail unrecallable."
-allowed-tools: Bash(git rev-parse:*), Bash(node:*), Read
+description: "Use when judging or planning around code not written this session: repo state, next steps, bug/dead-code calls, cleanup, or adding near existing code. Run orientation history before git/diff/README recon; after compaction, treat pre-compact work as unfamiliar."
 ---
 
 # Get Oriented Before You Judge Unfamiliar Code
 
-When you land in code you didn't write this session — fresh start, post-compact, someone else's work — you don't know its story. The trap: you read the code, the README, the diffs, and you *reconstruct* a story. That reconstruction is often wrong. A tidy README and a clean compile make abandoned work look done, and make in-flight work look finished. You then act on the wrong story.
+When you land in code you did not write this session, you do not know its
+story yet. The trap is reading the code, README, diffs, and tests and then
+reconstructing a plausible story. That reconstruction is often wrong. A tidy
+README and a clean compile can make abandoned work look finished, or make
+active work look stale.
 
-This skill pulls the **real** history from the action-graph (a record of past sessions in this project): the actual goal a human was pursuing when this code was written, whether it shipped, how recently it was touched, and what files moved with it. Facts, not your guess.
+This skill pulls the real orientation history from normalized agent work
+events: the human goal behind the code, whether it shipped, how recently it was
+touched, and which files moved with it.
 
-## The rule (do NOT wait to "feel unsure")
+## Frontmatter Safety
 
-The decision is **mechanical, not a feeling**. Ask one thing: *did I edit this code myself this session AND do I still recall its history?* If no to either, and you're about to answer a question about it or change it → run this skill FIRST.
+Keep this skill's YAML frontmatter to `name` and `description` only. Do not put
+tool allowlists, arrays, nested objects, or host-specific metadata there. Some
+hosts accept richer skill metadata and others reject it; this skill needs to
+load everywhere. Treat the commands below as usage guidance, not frontmatter
+schema.
 
-Don't rely on catching yourself mid-doubt. The failure mode is feeling *sure* — a clean compile and a tidy README make the missing history invisible, so the gap never registers as doubt. By the time you'd "feel" it, you've already concluded wrong. Trigger on the situation, not the sensation.
+Expected tool families when the host supports scoped permissions:
 
-**After a compact, "I wrote this this session" is NOT a valid skip.** A compaction replaces the earlier turns with a lossy summary — work you did *before* the compact is your own, but you can no longer recall it accurately; the summary drops detail, exact goals, and which attempts stalled. Treat pre-compact work like someone else's history: the action-graph still holds the real goals and recency (the PreCompact hook refreshes it just before compaction), so look it up instead of trusting the summary. The danger is the opposite of the fresh-session case — here you *feel* you know the code because "I built it", but the recall is gone.
+- `git rev-parse`
+- `orientation`
+- `node`
+- file reads
 
-**Always run it, before any git/Read recon, when:**
-- answering "what's next here?", "what's the state?", "what's left?" — these are planning questions but answering them *is* judging current state
-- judging code — "is this a bug?", "is this dead/leftover?", "can I trust this?"
-- deleting / gutting / "cleaning up" something whose purpose you're inferring
-- adding a function/feature into a file/area that already exists
+## The Rule
 
-**Why FIRST, not after recon:** `git log` shows only *committed* history. Live, in-flight work is uncommitted — invisible to git status, diffs, and the README. Running four recon commands feels thorough but can entirely miss the active thread; the action-graph is the only source that tracks uncommitted in-flight goals. Orient first, then recon fills in detail.
+The trigger is mechanical, not emotional. Ask one thing: did I edit this code
+myself in this un-compacted session, and do I still recall its history? If no
+to either, and you are about to answer a question about it or change it, run
+orientation first.
+
+Always run it before ordinary git/readme/diff recon when:
+
+- answering "what's next here?", "what's the state?", or "what's left?"
+- judging code as a bug, dead leftover, stale, or trustworthy
+- deleting, gutting, or cleaning up something whose purpose you are inferring
+- adding a function or feature into an existing file or area
+
+After a compaction, "I wrote this earlier" is not a valid skip. Compaction
+replaces the earlier turns with a lossy summary. Treat pre-compact work like
+someone else's history and ask orientation for the actual goals and recency.
 
 ## How
 
+```bash
+git rev-parse --show-toplevel
+orientation provenance "<root>" "<file>"
+orientation related "<root>" "<file>"
 ```
-git rev-parse --show-toplevel          # project root
-node ~/.claude/action-graph/consume.js --provenance "<root>" "<file>"   # judging / deleting / understanding
-node ~/.claude/action-graph/consume.js --related    "<root>" "<file>"   # before adding near it
+
+Use `provenance` when judging, deleting, or understanding existing code. Use
+`related` before adding near existing code.
+
+If `orientation` is not on `PATH`, use the installed engine fallback. Prefer
+the Eigen-local runtime when present, then the legacy compatibility path:
+
+```bash
+node ~/.eigen/orientation/consume.js --provenance "<root>" "<file>"
+node ~/.eigen/orientation/consume.js --related "<root>" "<file>"
+node ~/.claude/action-graph/consume.js --provenance "<root>" "<file>"
+node ~/.claude/action-graph/consume.js --related "<root>" "<file>"
 ```
 
-`<file>` takes any form — `src/auth.rs`, `auth.rs`, absolute.
+`<file>` may be a relative path, basename, or absolute path.
 
-## Reading `--provenance`
+## Reading Provenance
 
-The verdict line is recency-first. **Uncommitted does NOT mean abandoned** — in-flight work is uncommitted by definition (you commit at the end).
+The verdict line is recency-first. Uncommitted work is not abandoned by
+default; in-flight work is usually uncommitted.
 
-- **⚠ ACTIVELY IN FLIGHT** (touched recently) — someone is delivering this right now. Don't treat as dead or stale; continue it or ask, don't scrap it. This is the case people get wrong.
-- **⚠ DELIBERATE WORK** (committed, not recent) — built on purpose and shipped. Don't delete as cruft. A committed file can still hold one dead function, but the bar is now "I can show it's dead" (no callers/exports, tests pass), not "it looks unfamiliar".
-- **POSSIBLY STALE (uncertain)** (uncommitted, untouched a long time) — *might* be paused, *might* be dropped. Verify with the user or real signals; uncommitted alone is never proof it's abandoned.
-- **No recorded work** — silence isn't permission. Judge on the code (callers, exports, tests).
-- **Coupled neighbors** — files usually edited alongside this one; check them for ripple before concluding it's isolated.
+- `ACTIVELY IN FLIGHT`: someone is delivering this now. Continue it or ask;
+  do not scrap it as stale.
+- `DELIBERATE WORK`: committed, intentional work. Do not delete as cruft
+  unless callers, exports, and tests prove the specific code is dead.
+- `POSSIBLY STALE`: uncommitted and untouched for a long time. Verify with the
+  user or real signals before treating it as dropped.
+- `No recorded work`: silence is not permission. Judge from callers, exports,
+  tests, and behavior.
+- `Coupled neighbors`: files usually edited alongside this one. Check them
+  before treating the target as isolated.
 
-## Reading `--related` (before adding)
+## Reading Related
 
-- **Goals that already built here** — read them; extend or reconcile instead of duplicating or contradicting an earlier decision.
-- **Sibling files** — related logic likely lives here. Grep them + the target for what you're about to write, *before* writing it. The graph points at the area; you confirm the duplicate in the code.
+Read the goals that already built in this area. Extend or reconcile with those
+decisions instead of duplicating or contradicting them.
 
-## Examples
-
-**Fires (situation matches):**
-- "what's next for this repo?" on a project with uncommitted changes you didn't make → run `--provenance` on the changed files first. (Real case: the README roadmap said "structured output / scope" but the graph showed the live thread was a half-built model+indexing change — opposite conclusion.)
-- "this function looks like dead leftover, safe to delete?" → `--provenance`; a recency verdict of ACTIVELY IN FLIGHT means stop.
-- post-compact, asked to continue a feature → `--provenance` even though "you" built it; the summary lost which attempts stalled.
-
-**Skips (do not run):**
-- "fix this typo I just introduced" — wrote it this turn, recall intact.
-- "add a brand-new file `metrics.rs`" — net-new, no existing area to orient on.
-- continuing code you wrote earlier this same (un-compacted) session and still remember.
+Read sibling files that orientation reports. Grep those files and the target
+for the thing you are about to add before writing it.
 
 ## After
 
-Say what the history showed and how it changed your read. If a verdict and the code still seem to conflict, surface it to the user with the goal cited — don't act on your own reconstruction alone.
+Say what the history showed and how it changed your read. If the orientation
+verdict and the code seem to conflict, surface that conflict with the goal
+cited instead of acting on your reconstruction alone.
