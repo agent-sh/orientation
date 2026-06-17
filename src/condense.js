@@ -5,9 +5,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const os = require('os');
-
-const ROOT = path.join(os.homedir(), '.claude', 'action-graph', 'data');
+const { DATA: ROOT } = require('./paths');
 
 function loadRaw(dir) {
   const f = path.join(dir, 'raw.jsonl');

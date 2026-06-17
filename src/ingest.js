@@ -8,7 +8,7 @@
 //   node ingest.js <cwd>      → rebuild one project (force)
 //   node ingest.js --force    → rebuild all, ignore mtime cache
 //
-// Allowlist entries are cwd PREFIXES. A line `/home/avifenesh/projects` matches
+// Allowlist entries are cwd PREFIXES. A line `/home/you/projects` matches
 // every project (and nested repo) under it — each distinct session cwd becomes its
 // own project. Discovery reads the real cwd from each transcript (dir-name dashing
 // is ambiguous); incremental skip via per-project mtime manifest keeps Stop fast
@@ -16,14 +16,9 @@
 
 const fs = require('fs');
 const path = require('path');
-const os = require('os');
 const crypto = require('crypto');
 const { classify, ok, cleanIntent, gistText, branchMarker } = require('./classify');
-
-const HOME = os.homedir();
-const AG = path.join(HOME, '.claude', 'action-graph');
-const ROOT = path.join(AG, 'data');
-const PROJECTS_DIR = path.join(HOME, '.claude', 'projects');
+const { ACTION_GRAPH: AG, DATA: ROOT, PROJECTS_DIR } = require('./paths');
 
 function projectKey(cwd) {
   return crypto.createHash('sha1').update(cwd || 'unknown').digest('hex').slice(0, 12);
@@ -213,6 +208,7 @@ function main() {
 
   const prefixes = allowlist();
   if (!prefixes.length) { console.log('no projects in allowlist'); return; }
+  if (!fs.existsSync(PROJECTS_DIR)) { console.log(`no transcript directory at ${PROJECTS_DIR}`); return; }
 
   let built = 0, skipped = 0, nomatch = 0, errored = 0;
   for (const name of fs.readdirSync(PROJECTS_DIR)) {

@@ -6,10 +6,8 @@
 
 const fs = require('fs');
 const path = require('path');
-const os = require('os');
 const crypto = require('crypto');
-
-const ROOT = path.join(os.homedir(), '.claude', 'action-graph', 'data');
+const { DATA: ROOT } = require('./paths');
 
 function projectKey(cwd) {
   return crypto.createHash('sha1').update(cwd || 'unknown').digest('hex').slice(0, 12);

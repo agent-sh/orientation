@@ -10,8 +10,10 @@ const os = require('os');
 const { execFileSync } = require('child_process');
 const crypto = require('crypto');
 
+const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'orientation-selftest-'));
+process.env.ORIENTATION_HOME = path.join(tmp, 'action-graph');
 const AG = path.join(__dirname, '..', 'src'); // engine scripts live in src/ in the repo
-const ROOT = path.join(os.homedir(), '.claude', 'action-graph', 'data');
+const ROOT = path.join(process.env.ORIENTATION_HOME, 'data');
 const NODE = process.execPath;
 const FIX_CWD = '/__selftest__/proj';
 const key = crypto.createHash('sha1').update(FIX_CWD).digest('hex').slice(0, 12);
@@ -75,11 +77,11 @@ function run() {
   console.log('graph invariants:');
   const rels = graph.edges.reduce((m, e) => (m[e.rel] = (m[e.rel] || 0) + 1, m), {});
   assert((rels.touched || 0) > 0, 'touched edges exist');
-  assert((rels.coupled || 0) > 0, 'coupled edges exist (popup+auth co-edited)');
+  assert((rels.coupled || 0) > 0, 'coupled edges exist (popup+profile co-edited)');
   assert((rels.outcome || 0) > 0, 'outcome edges exist');
-  // popup.js + auth.js co-edited in two non-adjacent goals → resume edge
+  // popup.js + profile.js co-edited in two non-adjacent goals -> resume edge
   const resume = graph.edges.filter(e => e.rel === 'resumes');
-  assert(resume.length >= 1, 'at least one resume edge (popup/auth thread)');
+  assert(resume.length >= 1, 'at least one resume edge (popup/profile thread)');
   assert(resume.every(e => e.weight >= 0.45), 'all resume edges meet cosine floor 0.45');
 
   console.log('consume invariants:');
@@ -100,7 +102,7 @@ function run() {
   assert(/Last touched/.test(prov), 'provenance reports recency (the decisive signal)');
 
   // cleanup
-  fs.rmSync(dir, { recursive: true, force: true });
+  fs.rmSync(tmp, { recursive: true, force: true });
 
   console.log(failures ? `\nFAILED (${failures})` : '\nPASS');
   process.exit(failures ? 1 : 0);

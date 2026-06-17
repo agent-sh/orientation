@@ -1,24 +1,22 @@
 #!/usr/bin/env node
-// orientation installer — places the engine, the skill, and wires the Claude Code
+// orientation installer - places the engine, the skill, and wires the Claude Code
 // hooks. Idempotent: safe to re-run; never duplicates hooks or clobbers unrelated
 // settings. Run automatically on `npm install`, or manually: `node install.js`.
 //
 // What it does:
-//   1. copy src/*.js + refresh.sh        → ~/.claude/action-graph/
-//   2. copy skill/get-oriented/SKILL.md  → ~/.claude/skills/get-oriented/
-//   3. seed projects.txt (allowlist)     → ~/.claude/action-graph/ (if absent)
-//   4. wire SessionStart, Stop, PreCompact hooks → ~/.claude/settings.json
+//   1. copy src/*.js + refresh.sh        -> runtime home
+//   2. copy skill/get-oriented/SKILL.md  -> Claude skills directory
+//   3. seed projects.txt (allowlist)     -> runtime home (if absent)
+//   4. wire SessionStart, Stop, PreCompact hooks -> Claude settings.json
 //
-// The engine is hardcoded to run from ~/.claude/action-graph/ (hooks + skill
-// reference that path), so installation is a fixed-location copy, not a symlink.
+// Defaults match Claude Code's standard config layout. Set CLAUDE_CONFIG_DIR or
+// ORIENTATION_HOME before install to target another location.
 
 const fs = require('fs');
 const path = require('path');
-const os = require('os');
+const { CLAUDE, ACTION_GRAPH: AG } = require('./src/paths');
 
 const HERE = __dirname;
-const CLAUDE = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude');
-const AG = path.join(CLAUDE, 'action-graph');
 const SKILLS = path.join(CLAUDE, 'skills', 'get-oriented');
 const SETTINGS = path.join(CLAUDE, 'settings.json');
 
@@ -52,13 +50,38 @@ function seedAllowlist() {
   log(`projects.txt seeded → ${dst} (edit to opt projects in)`);
 }
 
-// Wire a command hook into one event, only if an equivalent isn't already present.
-function ensureHook(hooks, event, command, extra = {}) {
+function normalized(s) {
+  return String(s || '').replace(/\\/g, '/');
+}
+
+function isOwnedHook(command, scriptName, desiredCommand) {
+  const s = normalized(command);
+  const desired = normalized(desiredCommand);
+  return s === desired ||
+    s.includes('ORIENTATION_HOOK=1') ||
+    (s.includes('/action-graph/') && s.includes(`/${scriptName}`));
+}
+
+function sameHook(hook, desired) {
+  return hook.type === desired.type &&
+    hook.command === desired.command &&
+    hook.timeout === desired.timeout &&
+    hook.statusMessage === desired.statusMessage;
+}
+
+// Wire or repair a command hook into one event without disturbing unrelated hooks.
+function ensureHook(hooks, event, scriptName, command, extra = {}) {
   hooks[event] = hooks[event] || [];
-  const already = hooks[event].some(grp =>
-    (grp.hooks || []).some(h => typeof h.command === 'string' && h.command.includes('action-graph')));
-  if (already) return false;
-  hooks[event].push({ hooks: [{ type: 'command', command, ...extra }] });
+  const desired = { type: 'command', command, ...extra };
+  for (const grp of hooks[event]) {
+    for (const h of (grp.hooks || [])) {
+      if (typeof h.command !== 'string' || !isOwnedHook(h.command, scriptName, command)) continue;
+      if (sameHook(h, desired)) return false;
+      Object.assign(h, desired);
+      return true;
+    }
+  }
+  hooks[event].push({ hooks: [desired] });
   return true;
 }
 
@@ -70,13 +93,13 @@ function wireHooks() {
   }
   settings.hooks = settings.hooks || {};
 
-  const consume = `"${NODE}" "${path.join(AG, 'consume.js')}"`;
-  const refresh = `bash ${path.join(AG, 'refresh.sh')}`;
+  const consume = `ORIENTATION_HOOK=1 "${NODE}" "${path.join(AG, 'consume.js')}"`;
+  const refresh = `ORIENTATION_HOOK=1 bash "${path.join(AG, 'refresh.sh')}"`;
 
   let n = 0;
-  if (ensureHook(settings.hooks, 'SessionStart', consume, { timeout: 5, statusMessage: 'Loading orientation...' })) n++;
-  if (ensureHook(settings.hooks, 'Stop', refresh, { timeout: 60 })) n++;
-  if (ensureHook(settings.hooks, 'PreCompact', refresh, { timeout: 60 })) n++;
+  if (ensureHook(settings.hooks, 'SessionStart', 'consume.js', consume, { timeout: 5, statusMessage: 'Loading orientation...' })) n++;
+  if (ensureHook(settings.hooks, 'Stop', 'refresh.sh', refresh, { timeout: 60 })) n++;
+  if (ensureHook(settings.hooks, 'PreCompact', 'refresh.sh', refresh, { timeout: 60 })) n++;
 
   if (n) {
     fs.writeFileSync(SETTINGS, JSON.stringify(settings, null, 2));

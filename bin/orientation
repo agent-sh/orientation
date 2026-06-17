@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// orientation CLI — thin wrapper over the installed engine at ~/.claude/action-graph/.
+// orientation CLI — thin wrapper over the installed engine.
 // Subcommands:
 //   orientation install                  (re)install engine, skill, hooks
 //   orientation refresh                  rebuild graphs now (ingest→condense→graph)
@@ -9,25 +9,40 @@
 //   orientation coupled    <cwd> <file>  files co-edited with this one
 
 const path = require('path');
-const os = require('os');
 const { spawnSync } = require('child_process');
+const { ACTION_GRAPH: AG } = require('../src/paths');
 
-const CLAUDE = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude');
-const AG = path.join(CLAUDE, 'action-graph');
 const NODE = process.execPath;
 const [cmd, ...rest] = process.argv.slice(2);
 
+function finish(result) {
+  if (result.error) {
+    console.error(result.error.message);
+    process.exit(1);
+  }
+  if (result.signal) {
+    console.error(`terminated by ${result.signal}`);
+    process.exit(1);
+  }
+  process.exit(result.status == null ? 1 : result.status);
+}
+
 function run(file, args) {
   const r = spawnSync(NODE, [path.join(AG, file), ...args], { stdio: 'inherit' });
-  process.exit(r.status || 0);
+  finish(r);
+}
+
+function runLocal(file, args) {
+  const r = spawnSync(NODE, [path.join(__dirname, '..', file), ...args], { stdio: 'inherit' });
+  finish(r);
 }
 
 switch (cmd) {
   case 'install':
-    run(path.join('..', '..', 'install.js'), []); // not on PATH normally; prefer `npm run`
+    runLocal('install.js', rest);
     break;
   case 'refresh':
-    spawnSync('bash', [path.join(AG, 'refresh.sh')], { stdio: 'inherit' });
+    finish(spawnSync('bash', [path.join(AG, 'refresh.sh')], { stdio: 'inherit' }));
     break;
   case 'provenance':
     run('consume.js', ['--provenance', ...rest]);
@@ -45,6 +60,7 @@ switch (cmd) {
     console.log(`orientation — reconstruct the real history of code from Claude Code transcripts.
 
 usage:
+  orientation install                  install or repair engine, skill, and hooks
   orientation refresh                  rebuild graphs now
   orientation provenance <cwd> <file>  history + verdict (judging/deleting)
   orientation related    <cwd> <file>  prior work + siblings (before adding)
