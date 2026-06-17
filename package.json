@@ -36,7 +36,7 @@
   ],
   "scripts": {
     "postinstall": "node install.js",
-    "test": "node test/selftest.js"
+    "test": "node test/selftest.js && node test/skill-frontmatter.js"
   },
   "engines": {
     "node": ">=18.0.0"
