@@ -1,6 +1,6 @@
 {
   "name": "@agent-sh/orientation",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Stops AI coding agents from guessing the story of code they didn't write this session. Reconstructs real history (the goal behind code, shipped vs in-flight, coupled files) from Codex, Claude Code, and Eigen transcripts, surfaced via the get-oriented skill.",
   "keywords": [
     "agent-history",

@@ -1,6 +1,6 @@
 {
   "name": "orientation",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Reconstructs the real history of code (goal, shipped vs in-flight, coupled files) from Codex, Claude Code, and Eigen transcripts, surfaced via the get-oriented skill - so agents stop guessing the story of code they didn't write this session.",
   "author": {
     "name": "Avi Fenesh",

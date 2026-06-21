@@ -128,21 +128,29 @@ function copySkill(dst, dryRun) {
   log(`skill -> ${dst}`);
 }
 
+function readSeed() {
+  try {
+    return fs.readFileSync(PROJECTS_EXAMPLE, 'utf8');
+  } catch {
+    return '# orientation allowlist - one cwd prefix per line.\n# e.g. /home/you/projects\n';
+  }
+}
+
 function seedProjects(engineDir, dryRun) {
   const dst = path.join(engineDir, 'projects.txt');
-  if (fs.existsSync(dst)) {
-    log(`projects.txt exists -> ${dst}`);
-    return;
-  }
   if (dryRun) {
-    log(`would seed ${dst}`);
+    log(fs.existsSync(dst) ? `projects.txt exists -> ${dst}` : `would seed ${dst}`);
     return;
   }
-  const seed = fs.existsSync(PROJECTS_EXAMPLE)
-    ? fs.readFileSync(PROJECTS_EXAMPLE, 'utf8')
-    : '# orientation allowlist - one cwd prefix per line.\n# e.g. /home/you/projects\n';
-  fs.writeFileSync(dst, seed);
-  log(`projects.txt seeded -> ${dst}`);
+  // Exclusive create ('wx'): never clobbers an existing allowlist and is atomic,
+  // so there is no check-then-write TOCTOU window.
+  try {
+    fs.writeFileSync(dst, readSeed(), { flag: 'wx' });
+    log(`projects.txt seeded -> ${dst}`);
+  } catch (err) {
+    if (err.code === 'EEXIST') { log(`projects.txt exists -> ${dst}`); return; }
+    throw err;
+  }
 }
 
 function runHookManager(engineDir, runtime, dryRun) {

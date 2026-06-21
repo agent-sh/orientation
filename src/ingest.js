@@ -63,12 +63,14 @@ function readHead(file, n) {
 }
 
 function readJsonlChunk(file, startOffset = 0, startLine = 0) {
-  const stat = fs.statSync(file);
   let offset = startOffset;
   let line = startLine;
-  if (offset > stat.size) { offset = 0; line = 0; }
   const fd = fs.openSync(file, 'r');
   try {
+    // Stat the OPEN descriptor, not the path, so size matches the bytes we read
+    // (avoids a TOCTOU race if the transcript grows/truncates between stat+open).
+    const stat = fs.fstatSync(fd);
+    if (offset > stat.size) { offset = 0; line = 0; }
     const buf = Buffer.alloc(stat.size - offset);
     if (!buf.length) return { rows: [], nextOffset: offset, nextLine: line, size: stat.size };
     fs.readSync(fd, buf, 0, buf.length, offset);
