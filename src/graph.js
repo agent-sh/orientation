@@ -15,12 +15,11 @@
 
 const fs = require('fs');
 const path = require('path');
-const crypto = require('crypto');
-const { DATA: ROOT } = require('./paths');
+const { parseFilterArgs, filterEpisodes, hasFilters, describeFilters } = require('./filters');
+const { projectKeyCandidates, inspectProject } = require('./project');
+const { DATA_DIR } = require('./state');
 
-function projectKey(cwd) {
-  return crypto.createHash('sha1').update(cwd || 'unknown').digest('hex').slice(0, 12);
-}
+const ROOT = DATA_DIR;
 
 function loadEpisodes(dir) {
   const f = path.join(dir, 'episodes.json');
@@ -28,9 +27,69 @@ function loadEpisodes(dir) {
   try { return JSON.parse(fs.readFileSync(f, 'utf8')).episodes || []; } catch { return null; }
 }
 
+function readJson(f) {
+  try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return null; }
+}
+
+function projectDirs() {
+  if (!fs.existsSync(ROOT)) return [];
+  return fs.readdirSync(ROOT)
+    .filter(name => !name.startsWith('_'))
+    .map(name => path.join(ROOT, name))
+    .filter(d => {
+      try { return fs.statSync(d).isDirectory(); } catch { return false; }
+    });
+}
+
+function manifestForDir(dir) {
+  return readJson(path.join(dir, '.manifest.json')) || {};
+}
+
+function exactProjectDirs(cwd) {
+  return projectKeyCandidates(cwd)
+    .map(key => path.join(ROOT, key))
+    .filter((dir, index, dirs) => dirs.indexOf(dir) === index && fs.existsSync(dir));
+}
+
+function targetRepoKey(cwd) {
+  for (const dir of exactProjectDirs(cwd)) {
+    const exact = manifestForDir(dir);
+    if (exact.repoKey) return exact.repoKey;
+  }
+  return inspectProject(cwd).repoKey;
+}
+
+function loadEpisodeSet(cwd, filters = {}) {
+  if (filters.sameRepo) {
+    const repoKey = filters.repoKey || targetRepoKey(cwd);
+    const episodes = [];
+    const projects = [];
+    for (const dir of projectDirs()) {
+      const manifest = manifestForDir(dir);
+      if (manifest.repoKey !== repoKey) continue;
+      const eps = loadEpisodes(dir);
+      if (!eps) continue;
+      projects.push({ key: path.basename(dir), cwd: manifest.cwd, repoKey, worktreeCwd: manifest.worktreeCwd });
+      episodes.push(...eps);
+    }
+    if (!episodes.length) return null;
+    return { cwd, repoKey, projects, episodes };
+  }
+  const episodes = [];
+  const projects = [];
+  for (const dir of exactProjectDirs(cwd)) {
+    const eps = loadEpisodes(dir);
+    if (!eps) continue;
+    const manifest = manifestForDir(dir);
+    projects.push({ key: path.basename(dir), cwd: manifest.cwd || cwd, repoKey: manifest.repoKey, worktreeCwd: manifest.worktreeCwd });
+    episodes.push(...eps);
+  }
+  return episodes.length ? { cwd, projects, episodes } : null;
+}
+
 function buildGraph(episodes) {
   const nodes = new Map(); // id -> {id, type, label, count}
-  const couple = new Map(); // "a\\0b" (sorted) -> weight
+  const couple = new Map(); // "a\0b" (sorted) -> weight
   const touched = new Map(); // intentId -> Set(file)
   const outcomes = []; // {intent, outcome}
 
@@ -158,6 +217,226 @@ function coupledWith(graph, file) {
     .sort((a, b) => b.weight - a.weight);
 }
 
+function makeMatcher(file, known) {
+  const base = file.split('/').slice(-2).join('/');
+  const bare = file.split('/').pop();
+  const exactExists = known.has(base);
+  const match = f => exactExists ? f === base : (f === base || f.endsWith('/' + bare) || f === bare);
+  return { match, base };
+}
+
+function graphForQuery(cwd, episodes, filters = {}) {
+  if (!hasFilters(filters)) {
+    const dirs = exactProjectDirs(cwd)
+      .filter(dir => fs.existsSync(path.join(dir, 'graph.json')));
+    if (dirs.length === 1) {
+      const cached = readJson(path.join(dirs[0], 'graph.json'));
+      if (cached) return { graph: cached, source: 'cached' };
+    }
+  }
+  return { graph: buildGraph(episodes), source: 'temporary' };
+}
+
+function coupledWithMatcher(graph, match) {
+  const matched = new Set((graph.nodes || [])
+    .filter(n => n.type === 'file' && match(n.label))
+    .map(n => n.id));
+  if (!matched.size) return { matchedFiles: [], hits: [] };
+
+  const byFile = new Map();
+  for (const e of graph.edges || []) {
+    if (e.rel !== 'coupled') continue;
+    const fromMatch = matched.has(e.from);
+    const toMatch = matched.has(e.to);
+    if (fromMatch && toMatch) continue;
+    const other = fromMatch ? e.to : toMatch ? e.from : null;
+    if (!other) continue;
+    const file = other.replace('file:', '');
+    byFile.set(file, (byFile.get(file) || 0) + (e.weight || 0));
+  }
+
+  return {
+    matchedFiles: [...matched].map(id => id.replace('file:', '')),
+    hits: [...byFile.entries()]
+      .map(([file, weight]) => ({ file, weight }))
+      .sort((a, b) => b.weight - a.weight),
+  };
+}
+
+function couplingSupport(episodes, match, coupledFile, limit = 3) {
+  return episodes
+    .filter(ep => {
+      const files = ep.filesTouched || [];
+      return files.includes(coupledFile) && files.some(match);
+    })
+    .sort((a, b) => String(b.t || '').localeCompare(String(a.t || '')))
+    .slice(0, limit)
+    .map(episodeSummary);
+}
+
+function episodeForIntent(episodes, id) {
+  const idx = Number(String(id || '').split(':')[1]);
+  return Number.isInteger(idx) ? episodes[idx] : null;
+}
+
+function episodeSummary(ep) {
+  if (!ep) return null;
+  return {
+    t: ep.t,
+    id: ep.id,
+    session: ep.session,
+    runtime: ep.runtime,
+    adapter: ep.adapter,
+    sourceKind: ep.sourceKind,
+    gitBranch: ep.gitBranch,
+    gitBranchSource: ep.gitBranchSource,
+    branchHistory: ep.branchHistory || [],
+    projectKey: ep.projectKey,
+    projectKeyVersion: ep.projectKeyVersion,
+    legacyProjectKey: ep.legacyProjectKey,
+    repoKey: ep.repoKey,
+    worktreeCwd: ep.worktreeCwd,
+    intent: ep.intent,
+    filesTouched: ep.filesTouched || [],
+    sources: ep.sources || [],
+    evidence: ep.evidence || [],
+  };
+}
+
+function evidenceLine(ep) {
+  if (!ep) return '';
+  const ev = (ep.evidence || []).find(x => x.source) || {};
+  const loc = ev.source ? `${ev.source}${ev.sourceLine ? `:${ev.sourceLine}` : ''}` : null;
+  return [
+    ep.id && `goal=${ep.id}`,
+    ep.runtime,
+    ep.session && `session=${ep.session}`,
+    ep.gitBranch && `branch=${ep.gitBranch}${ep.gitBranchSource ? `/${ep.gitBranchSource}` : ''}`,
+    ep.worktreeCwd && `worktree=${ep.worktreeCwd}`,
+    loc,
+  ].filter(Boolean).join(' ');
+}
+
+function threadResults(graph, episodes) {
+  return (graph.edges || [])
+    .filter(e => e.rel === 'resumes')
+    .sort((a, b) => b.weight - a.weight)
+    .map(e => ({
+      weight: e.weight,
+      via: e.via || [],
+      from: episodeSummary(episodeForIntent(episodes, e.from)),
+      to: episodeSummary(episodeForIntent(episodes, e.to)),
+    }));
+}
+
+function printJson(obj) {
+  process.stdout.write(JSON.stringify(obj, null, 2) + '\n');
+}
+
+function splitRenderArgs(argv) {
+  return { json: argv.includes('--json'), argv: argv.filter(a => a !== '--json') };
+}
+
+function printFilterNote(filters) {
+  if (hasFilters(filters)) console.log(`Filters: ${describeFilters(filters)}\n`);
+}
+
+function coupledMode(cwd, file, filters = {}, opts = {}) {
+  const data = loadEpisodeSet(cwd, filters);
+  if (!data) {
+    if (opts.json) printJson({ type: 'coupled', cwd, file, filters, status: 'no_project', count: 0, coupled: [] });
+    else console.log('(no graph yet)');
+    return;
+  }
+  const episodes = filterEpisodes(data.episodes, filters);
+  if (!episodes.length) {
+    if (opts.json) printJson({ type: 'coupled', cwd, file, filters, status: 'no_match', count: 0, coupled: [] });
+    else console.log(`(no filtered history for ${file})`);
+    return;
+  }
+  const { graph, source } = graphForQuery(cwd, episodes, filters);
+  const known = new Set([
+    ...episodes.flatMap(e => e.filesTouched || []),
+    ...((graph.nodes || []).filter(n => n.type === 'file').map(n => n.label)),
+  ]);
+  const { match } = makeMatcher(file, known);
+  const result = coupledWithMatcher(graph, match);
+  const coupled = result.hits.map(hit => ({
+    ...hit,
+    supportingGoals: couplingSupport(episodes, match, hit.file),
+  }));
+
+  if (opts.json) {
+    printJson({
+      type: 'coupled',
+      cwd,
+      file,
+      filters,
+      graphSource: source,
+      status: result.hits.length ? 'ok' : 'no_match',
+      matchedFiles: result.matchedFiles,
+      count: coupled.length,
+      coupled,
+    });
+    return;
+  }
+
+  printFilterNote(filters);
+  if (!coupled.length) { console.log(`(no files coupled with ${file})`); return; }
+  console.log(`Files co-edited with ${file}${source === 'temporary' ? ' in filtered history' : ''}:`);
+  for (const hit of coupled.slice(0, 12)) {
+    console.log(`  ${hit.file}  (${hit.weight}x)`);
+    const support = hit.supportingGoals[0];
+    const why = evidenceLine(support);
+    if (why) console.log(`      why: ${why}`);
+    if (support?.intent) console.log(`      goal: ${support.intent.slice(0, 76)}`);
+  }
+}
+
+function threadsMode(cwd, filters = {}, opts = {}) {
+  const data = loadEpisodeSet(cwd, filters);
+  if (!data) {
+    if (opts.json) printJson({ type: 'threads', cwd, filters, status: 'no_project', count: 0, threads: [] });
+    else console.log('(no graph yet)');
+    return;
+  }
+  const episodes = filterEpisodes(data.episodes, filters);
+  if (!episodes.length) {
+    if (opts.json) printJson({ type: 'threads', cwd, filters, status: 'no_match', count: 0, threads: [] });
+    else console.log('(no filtered history)');
+    return;
+  }
+  const { graph, source } = graphForQuery(cwd, episodes, filters);
+  const res = threadResults(graph, episodes);
+
+  if (opts.json) {
+    printJson({
+      type: 'threads',
+      cwd,
+      filters,
+      graphSource: source,
+      status: res.length ? 'ok' : 'no_match',
+      count: res.length,
+      threads: res,
+    });
+    return;
+  }
+
+  printFilterNote(filters);
+  if (!res.length) { console.log('(no resume threads found)'); return; }
+  console.log(`${res.length} resume thread(s) — goals rejoined across detours${source === 'temporary' ? ' in filtered history' : ''}:\n`);
+  for (const e of res.slice(0, 12)) {
+    const fromWhy = evidenceLine(e.from);
+    const toWhy = evidenceLine(e.to);
+    console.log(`  ${e.weight}  via ${e.via.join(', ')}`);
+    console.log(`     ↩ ${(e.from?.intent || '').slice(0, 70)}`);
+    if (fromWhy) console.log(`       why: ${fromWhy}`);
+    console.log(`     ↪ ${(e.to?.intent || '').slice(0, 70)}`);
+    if (toWhy) console.log(`       why: ${toWhy}`);
+    console.log('');
+  }
+}
+
 function buildProject(dir) {
   const eps = loadEpisodes(dir);
   if (!eps) return null;
@@ -169,30 +448,15 @@ function buildProject(dir) {
 function main() {
   const args = process.argv.slice(2);
   if (args[0] === '--coupled') {
-    const cwd = args[1], file = args.slice(2).join(' ');
-    const f = path.join(ROOT, projectKey(cwd), 'graph.json');
-    if (!fs.existsSync(f)) { console.log('(no graph yet)'); return; }
-    const g = JSON.parse(fs.readFileSync(f, 'utf8'));
-    const hits = coupledWith(g, file);
-    if (!hits.length) { console.log(`(no files coupled with ${file})`); return; }
-    console.log(`Files co-edited with ${file}:`);
-    hits.forEach(h => console.log(`  ${h.file}  (${h.weight}x)`));
+    const render = splitRenderArgs(args.slice(1));
+    const { positionals, filters } = parseFilterArgs(render.argv);
+    coupledMode(positionals[0] || process.cwd(), positionals.slice(1).join(' '), filters, { json: render.json });
     return;
   }
   if (args[0] === '--threads') {
-    const cwd = args[1];
-    const f = path.join(ROOT, projectKey(cwd), 'graph.json');
-    if (!fs.existsSync(f)) { console.log('(no graph yet)'); return; }
-    const g = JSON.parse(fs.readFileSync(f, 'utf8'));
-    const label = id => (g.nodes.find(n => n.id === id) || {}).label || id;
-    const res = g.edges.filter(e => e.rel === 'resumes').sort((a, b) => b.weight - a.weight);
-    if (!res.length) { console.log('(no resume threads found)'); return; }
-    console.log(`${res.length} resume thread(s) — goals rejoined across detours:\n`);
-    for (const e of res.slice(0, 12)) {
-      console.log(`  ${e.weight}  via ${e.via.join(', ')}`);
-      console.log(`     ↩ ${label(e.from).slice(0, 70)}`);
-      console.log(`     ↪ ${label(e.to).slice(0, 70)}\n`);
-    }
+    const render = splitRenderArgs(args.slice(1));
+    const { positionals, filters } = parseFilterArgs(render.argv);
+    threadsMode(positionals[0] || process.cwd(), filters, { json: render.json });
     return;
   }
   if (!fs.existsSync(ROOT)) return;
@@ -205,5 +469,5 @@ function main() {
   }
 }
 
-module.exports = { buildGraph, coupledWith };
+module.exports = { buildGraph, coupledWith, coupledWithMatcher, threadResults };
 main();

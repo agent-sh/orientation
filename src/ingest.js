@@ -1,12 +1,14 @@
 #!/usr/bin/env node
-// action-graph ingest — single source of truth. Reparses Claude Code transcripts
+// action-graph ingest — single source of truth. Normalizes agent transcripts
 // (the JSONL that already records EVERYTHING: user prompts, agent text, tool calls,
-// todos, commits) into raw.jsonl. Replaces live capture + backport: no lossy hooks,
-// no live/backfill divergence, no append-ordering. Full rebuild each run (idempotent).
+// todos, commits) into append-only raw.jsonl. Derived episodes/graphs can be
+// rebuilt, but raw events are preserved and de-duped by transcript evidence.
 //
-//   node ingest.js            → rebuild every allowlisted project (incremental)
-//   node ingest.js <cwd>      → rebuild one project (force)
-//   node ingest.js --force    → rebuild all, ignore mtime cache
+//   node ingest.js            → append unseen Claude records for allowlisted projects
+//   node ingest.js <cwd>      → append unseen Claude records for one project
+//   node ingest.js --force    → rescan all Claude sources, still append-only
+//   node ingest.js --runtime claude|codex|eigen --source <jsonl> --cwd <cwd> --cursor
+//                             → append only new records from one transcript
 //
 // Allowlist entries are cwd PREFIXES. A line `/home/you/projects` matches
 // every project (and nested repo) under it — each distinct session cwd becomes its
@@ -17,15 +19,16 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { classify, ok, cleanIntent, gistText, branchMarker } = require('./classify');
-const { ACTION_GRAPH: AG, DATA: ROOT, PROJECTS_DIR } = require('./paths');
+const { parseRows, inferCwd, resolveAdapter } = require('./adapters');
+const { projectKey, sourceKey, inspectProject, eventIdentity } = require('./project');
+const { ORIENTATION_HOME, DATA_DIR, ALLOWLIST_FILE, CLAUDE_PROJECTS_DIR, CODEX_SESSIONS_DIR, EIGEN_DIR } = require('./state');
 
-function projectKey(cwd) {
-  return crypto.createHash('sha1').update(cwd || 'unknown').digest('hex').slice(0, 12);
-}
+const ROOT = DATA_DIR;
+const PROJECTS_DIR = CLAUDE_PROJECTS_DIR;
+const FINGERPRINT_BYTES = 64 * 1024;
 
 function allowlist() {
-  const f = path.join(AG, 'projects.txt');
+  const f = ALLOWLIST_FILE;
   if (!fs.existsSync(f)) return [];
   return fs.readFileSync(f, 'utf8').split('\n').map(s => s.trim()).filter(s => s && !s.startsWith('#'));
 }
@@ -59,6 +62,91 @@ function readHead(file, n) {
   } finally { fs.closeSync(fd); }
 }
 
+function readJsonlChunk(file, startOffset = 0, startLine = 0) {
+  let offset = startOffset;
+  let line = startLine;
+  const fd = fs.openSync(file, 'r');
+  try {
+    // Stat the OPEN descriptor, not the path, so size matches the bytes we read
+    // (avoids a TOCTOU race if the transcript grows/truncates between stat+open).
+    const stat = fs.fstatSync(fd);
+    if (offset > stat.size) { offset = 0; line = 0; }
+    const buf = Buffer.alloc(stat.size - offset);
+    if (!buf.length) return { rows: [], nextOffset: offset, nextLine: line, size: stat.size };
+    fs.readSync(fd, buf, 0, buf.length, offset);
+    const lastNl = buf.lastIndexOf(10);
+    if (lastNl === -1) return { rows: [], nextOffset: offset, nextLine: line, size: stat.size };
+
+    const complete = buf.subarray(0, lastNl + 1);
+    const rows = [];
+    let pos = 0;
+    while (pos < complete.length) {
+      const nl = complete.indexOf(10, pos);
+      const end = nl === -1 ? complete.length : nl;
+      const lineBuf = complete.subarray(pos, end);
+      line++;
+      if (lineBuf.length) {
+        try {
+          const row = JSON.parse(lineBuf.toString('utf8'));
+          row.__sourceLine = line;
+          row.__sourceOffset = offset + pos;
+          rows.push(row);
+        } catch {}
+      }
+      pos = end + 1;
+    }
+    return { rows, nextOffset: offset + complete.length, nextLine: line, size: stat.size };
+  } finally { fs.closeSync(fd); }
+}
+
+function readRange(file, start, length) {
+  if (length <= 0) return Buffer.alloc(0);
+  const fd = fs.openSync(file, 'r');
+  try {
+    const buf = Buffer.alloc(length);
+    const read = fs.readSync(fd, buf, 0, length, start);
+    return read === length ? buf : buf.subarray(0, read);
+  } finally { fs.closeSync(fd); }
+}
+
+function bufferHash(buf) {
+  return crypto.createHash('sha1').update(buf).digest('hex');
+}
+
+function sourceFingerprint(file) {
+  const stat = fs.statSync(file);
+  const headLen = Math.min(FINGERPRINT_BYTES, stat.size);
+  const tailStart = Math.max(0, stat.size - FINGERPRINT_BYTES);
+  const tailLen = stat.size - tailStart;
+  return {
+    algorithm: 'sha1-head-tail-v1',
+    bytes: FINGERPRINT_BYTES,
+    size: stat.size,
+    mtimeMs: stat.mtimeMs,
+    headHash: bufferHash(readRange(file, 0, headLen)),
+    tailHash: bufferHash(readRange(file, tailStart, tailLen)),
+  };
+}
+
+function cursorResetReason(cursor, fingerprint) {
+  if (!cursor) return null;
+  if ((cursor.offset || 0) > fingerprint.size) return 'source shrank';
+  if (cursor.fingerprint?.headHash && cursor.fingerprint.headHash !== fingerprint.headHash) {
+    return 'source fingerprint changed';
+  }
+  return null;
+}
+
+function sourceCwd(file, runtime = 'claude') {
+  const lines = readHead(file, 200);
+  const rows = [];
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    try { rows.push(JSON.parse(line)); } catch {}
+  }
+  return inferCwd(runtime, rows, { source: file });
+}
+
 // Latest mtime across a dir's transcripts — the incremental-skip key.
 function dirMtime(dir) {
   let m = 0;
@@ -70,100 +158,88 @@ function dirMtime(dir) {
   return m;
 }
 
-function parseTranscript(file) {
+function readJsonlFile(file) {
   const rows = [];
-  const data = fs.readFileSync(file, 'utf8').split('\n');
-  for (const line of data) {
+  const data = fs.readFileSync(file, 'utf8');
+  let offset = 0;
+  let lineNo = 0;
+  for (const line of data.split('\n')) {
+    lineNo++;
+    if (line.trim()) {
+      try {
+        const row = JSON.parse(line);
+        row.__sourceLine = lineNo;
+        row.__sourceOffset = offset;
+        rows.push(row);
+      } catch {}
+    }
+    offset += Buffer.byteLength(line) + 1;
+  }
+  return rows;
+}
+
+function parseTranscript(file, meta = {}) {
+  return parseRows('claude', readJsonlFile(file), { ...meta, runtime: 'claude', source: meta.source || file });
+}
+
+function stableString(value) {
+  if (Array.isArray(value)) return `[${value.map(stableString).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map(k => `${JSON.stringify(k)}:${stableString(value[k])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function recordKey(record) {
+  if (record.source && (record.sourceLine != null || record.sourceOffset != null)) {
+    return [
+      'src',
+      record.runtime || '',
+      record.adapter || '',
+      record.source,
+      record.sourceLine ?? '',
+      record.sourceOffset ?? '',
+      record.kind || '',
+      record.turn || '',
+      record.tool || '',
+      record.session || '',
+    ].join('|');
+  }
+  if (record.source && record.turn && record.kind) {
+    return ['turn', record.runtime || '', record.adapter || '', record.source, record.turn, record.kind, record.tool || '', record.session || ''].join('|');
+  }
+  return 'hash|' + crypto.createHash('sha1').update(stableString(record)).digest('hex');
+}
+
+function rawIndex(outDir) {
+  const f = path.join(outDir, 'raw.jsonl');
+  const keys = new Set();
+  let count = 0;
+  if (!fs.existsSync(f)) return { keys, count };
+  for (const line of fs.readFileSync(f, 'utf8').split('\n')) {
     if (!line.trim()) continue;
-    try { rows.push(JSON.parse(line)); } catch {}
+    count++;
+    try { keys.add(recordKey(JSON.parse(line))); } catch {}
   }
-  // index tool_result by id for success detection
-  const resultById = new Map();
-  for (const d of rows) {
-    if (d.type !== 'user') continue;
-    const c = d.message && d.message.content;
-    if (!Array.isArray(c)) continue;
-    for (const b of c) if (b && b.type === 'tool_result') resultById.set(b.tool_use_id, b.content);
-  }
-
-  const out = [];
-  let activeTodo = null; // current in_progress todo content = best subgoal label
-  let pendingInterrupt = false; // last user action was a hard interrupt
-
-  for (const d of rows) {
-    const t = d.timestamp || '';
-    const session = (d.sessionId || '').slice(0, 8);
-
-    if (d.type === 'user') {
-      // interruption = user cut the agent off mid-work. Unambiguous branch-away
-      // point, free from the transcript, no model. Mark it as its own node.
-      if (isInterruption(d.message && d.message.content)) {
-        out.push({ t, session, kind: 'interrupt' });
-        pendingInterrupt = true;
-        continue;
-      }
-      const intent = userIntent(d.message && d.message.content);
-      if (intent) {
-        const rec = { t, session, kind: 'intent', text: intent.slice(0, 300) };
-        // branch source priority: explicit lexical marker > structural (post-interrupt).
-        // A prompt right after an interrupt is a steer-away even with no marker —
-        // catches the deictic silent branches text alone can't ("the location is wrong").
-        const br = branchMarker(intent);
-        if (br) rec.branch = br;
-        else if (pendingInterrupt) { rec.branch = 'steer'; rec.branchSrc = 'interrupt'; }
-        out.push(rec);
-        pendingInterrupt = false;
-      }
-      continue;
-    }
-    if (d.type !== 'assistant') continue;
-
-    const blocks = (d.message && d.message.content) || [];
-    const turn = (d.uuid || (d.message && d.message.id) || '').slice(-12);
-
-    for (const b of blocks) {
-      if (!b) continue;
-      if (b.type === 'text') {
-        const g = gistText(b.text);
-        if (g) out.push({ t, session, turn, kind: 'say', text: g.text, cue: g.cue });
-        continue;
-      }
-      if (b.type !== 'tool_use') continue;
-
-      // TodoWrite updates the active-subgoal pointer; not itself an action
-      if (b.name === 'TodoWrite') {
-        const todos = Array.isArray(b.input && b.input.todos) ? b.input.todos : [];
-        const ip = todos.find(x => x && x.status === 'in_progress');
-        activeTodo = ip ? ip.content : activeTodo;
-        out.push({ t, session, turn, kind: 'todo', active: activeTodo, items: todos.length });
-        continue;
-      }
-
-      const c = classify(b.name, b.input);
-      c.t = t; c.session = session; c.tool = b.name; c.turn = turn;
-      if (activeTodo) c.subgoal = activeTodo; // best-effort subgoal tag from todo lens
-      if (!ok(resultById.get(b.id))) c.failed = true;
-      out.push(c);
-    }
-  }
-  return out;
+  return { keys, count };
 }
 
-function isInterruption(content) {
-  if (Array.isArray(content)) {
-    return content.some(b => b && b.type === 'text' && /^\[Request interrupted/.test(b.text || ''));
+function appendUniqueRaw(outDir, records) {
+  fs.mkdirSync(outDir, { recursive: true });
+  if (!records.length) {
+    const { count } = rawIndex(outDir);
+    return { appended: 0, total: count };
   }
-  return typeof content === 'string' && /^\[Request interrupted/.test(content);
-}
-
-function userIntent(content) {
-  if (typeof content === 'string') return cleanIntent(content);
-  if (Array.isArray(content)) {
-    if (content.some(b => b && b.type === 'tool_result')) return null;
-    const textBlk = content.find(b => b && b.type === 'text');
-    return textBlk ? cleanIntent(textBlk.text) : null;
+  const { keys, count } = rawIndex(outDir);
+  const fresh = [];
+  for (const record of records) {
+    const key = recordKey(record);
+    if (keys.has(key)) continue;
+    keys.add(key);
+    fresh.push(record);
   }
-  return null;
+  if (fresh.length) fs.appendFileSync(path.join(outDir, 'raw.jsonl'), fresh.map(r => JSON.stringify(r)).join('\n') + '\n');
+  return { appended: fresh.length, total: count + fresh.length };
 }
 
 function rebuildProject(dir, cwd) {
@@ -171,14 +247,33 @@ function rebuildProject(dir, cwd) {
     .map(f => path.join(dir, f))
     .sort((a, b) => fs.statSync(a).mtimeMs - fs.statSync(b).mtimeMs); // oldest first
 
+  const identity = inspectProject(cwd);
   let all = [];
-  for (const f of files) all = all.concat(parseTranscript(f));
+  for (const f of files) {
+    all = all.concat(parseTranscript(f, {
+      runtime: 'claude',
+      source: f,
+      cwd,
+      identity: eventIdentity(identity),
+    }));
+  }
 
   const outDir = path.join(ROOT, projectKey(cwd));
-  fs.mkdirSync(outDir, { recursive: true });
-  fs.writeFileSync(path.join(outDir, 'raw.jsonl'), all.map(r => JSON.stringify(r)).join('\n') + '\n');
-  fs.writeFileSync(path.join(outDir, '.manifest.json'), JSON.stringify({ cwd, srcMtime: dirMtime(dir), records: all.length }));
-  return { cwd, key: projectKey(cwd), records: all.length, sessions: files.length };
+  const manifest = path.join(outDir, '.manifest.json');
+  let prior = {};
+  try { prior = JSON.parse(fs.readFileSync(manifest, 'utf8')); } catch {}
+  const write = appendUniqueRaw(outDir, all);
+  fs.writeFileSync(path.join(outDir, '.manifest.json'), JSON.stringify({
+    ...prior,
+    cwd,
+    ...eventIdentity(identity),
+    currentBranch: identity.currentBranch,
+    srcMtime: dirMtime(dir),
+    fullRefreshAppendOnly: true,
+    records: write.total,
+    lastFullRefresh: new Date().toISOString(),
+  }, null, 2));
+  return { cwd, key: projectKey(cwd), records: write.appended, totalRecords: write.total, sessions: files.length };
 }
 
 function prefixMatch(cwd, prefixes) {
@@ -188,13 +283,226 @@ function prefixMatch(cwd, prefixes) {
 // Already-built and source unchanged since last build?
 function isFresh(cwd, dir) {
   const mf = path.join(ROOT, projectKey(cwd), '.manifest.json');
+  if (!fs.existsSync(path.join(ROOT, projectKey(cwd), 'raw.jsonl'))) return false;
   if (!fs.existsSync(mf)) return false;
   try { return JSON.parse(fs.readFileSync(mf, 'utf8')).srcMtime === dirMtime(dir); } catch { return false; }
+}
+
+function cursorFile(runtime, source) {
+  return path.join(ROOT, '_cursors', `${sourceKey(runtime, source)}.json`);
+}
+
+function loadCursor(runtime, source) {
+  const f = cursorFile(runtime, source);
+  if (!fs.existsSync(f)) return null;
+  try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return null; }
+}
+
+function saveCursor(runtime, source, cursor) {
+  const f = cursorFile(runtime, source);
+  fs.mkdirSync(path.dirname(f), { recursive: true });
+  const tmp = `${f}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(cursor, null, 2));
+  fs.renameSync(tmp, f);
+}
+
+function appendRaw(cwd, records, identity = inspectProject(cwd)) {
+  const outDir = path.join(ROOT, projectKey(cwd));
+  const write = appendUniqueRaw(outDir, records);
+  const manifest = path.join(outDir, '.manifest.json');
+  let prior = {};
+  try { prior = JSON.parse(fs.readFileSync(manifest, 'utf8')); } catch {}
+  fs.writeFileSync(manifest, JSON.stringify({
+    ...prior,
+    cwd,
+    ...eventIdentity(identity),
+    currentBranch: identity.currentBranch,
+    cursorIngest: true,
+    records: write.total,
+    lastCursorIngest: new Date().toISOString(),
+  }, null, 2));
+  return { outDir, appended: write.appended, totalRecords: write.total };
+}
+
+function ingestSourceWithCursor(opts) {
+  const adapter = resolveAdapter(opts.runtime, opts.source);
+  if (!opts.source) throw new Error('--source is required');
+  if (!fs.existsSync(opts.source)) throw new Error(`source does not exist: ${opts.source}`);
+
+  let cursor = opts.cursor ? loadCursor(adapter.name, opts.source) : null;
+  const fingerprint = opts.cursor ? sourceFingerprint(opts.source) : null;
+  const resetReason = opts.cursor ? cursorResetReason(cursor, fingerprint) : null;
+  if (resetReason) cursor = { ...cursor, offset: 0, line: 0 };
+  const chunk = readJsonlChunk(opts.source, cursor?.offset || 0, cursor?.line || 0);
+  const cwd = opts.cwd || cursor?.cwd
+    || inferCwd(adapter.name, chunk.rows, { source: opts.source })
+    || sourceCwd(opts.source, adapter.name);
+  // Soft skip, not throw: a misnamed/missing eigen meta must not crash a hook
+  // (process.exit(1)) on the single-source path. The caller treats skipped
+  // sources as benign and still reports the reason for manual single-source runs.
+  if (!cwd) return { skipped: true, reason: 'could not determine cwd (pass --cwd)', cwd: null, records: 0, rows: chunk.rows.length };
+  const identity = inspectProject(cwd);
+  const gitBranch = opts.gitBranch || identity.currentBranch || null;
+  const gitBranchSource = opts.gitBranch ? (opts.gitBranchSource || 'cli') : (gitBranch ? 'inferred' : null);
+
+  const prefixes = allowlist();
+  if (!opts.allowUnlisted && prefixes.length && !prefixMatch(cwd, prefixes)) {
+    return { skipped: true, reason: 'outside allowlist', cwd, records: 0, rows: chunk.rows.length };
+  }
+
+  const records = parseRows(adapter.name, chunk.rows, {
+    runtime: adapter.runtime,
+    adapter: adapter.name,
+    sourceKind: adapter.sourceKind,
+    source: opts.source,
+    cwd,
+    session: cursor?.session || path.basename(opts.source, '.jsonl'),
+    gitBranch,
+    gitBranchSource,
+    identity: eventIdentity(identity),
+  });
+  const write = appendRaw(cwd, records, identity);
+
+  if (opts.cursor) {
+    const nextCursor = {
+      runtime: adapter.runtime,
+      adapter: adapter.name,
+      source: opts.source,
+      sourceKey: sourceKey(adapter.name, opts.source),
+      session: records.find(r => r.session)?.session || cursor?.session || path.basename(opts.source, '.jsonl'),
+      cwd,
+      ...eventIdentity(identity),
+      currentBranch: identity.currentBranch,
+      offset: chunk.nextOffset,
+      line: chunk.nextLine,
+      size: chunk.size,
+      fingerprint,
+      records: (cursor?.records || 0) + write.appended,
+      lastEventTime: records.map(r => r.t).filter(Boolean).pop() || cursor?.lastEventTime || null,
+      resets: (cursor?.resets || 0) + (resetReason ? 1 : 0),
+      lastResetReason: resetReason || cursor?.lastResetReason || undefined,
+      lastResetAt: resetReason ? new Date().toISOString() : cursor?.lastResetAt || undefined,
+      updated: new Date().toISOString(),
+    };
+    saveCursor(adapter.name, opts.source, nextCursor);
+  }
+
+  return {
+    skipped: false,
+    runtime: adapter.runtime,
+    adapter: adapter.name,
+    cwd,
+    key: projectKey(cwd),
+    outDir: write.outDir,
+    rows: chunk.rows.length,
+    records: write.appended,
+    parsedRecords: records.length,
+    totalRecords: write.totalRecords,
+    offset: chunk.nextOffset,
+    line: chunk.nextLine,
+    cursorReset: resetReason,
+  };
+}
+
+function walkFiles(root, predicate, out = []) {
+  if (!fs.existsSync(root)) return out;
+  for (const name of fs.readdirSync(root)) {
+    const p = path.join(root, name);
+    let st;
+    try { st = fs.statSync(p); } catch { continue; }
+    if (st.isDirectory()) walkFiles(p, predicate, out);
+    else if (predicate(p, name)) out.push(p);
+  }
+  return out;
+}
+
+function discoverSources(runtimeOrAdapter) {
+  const raw = String(runtimeOrAdapter || 'claude').replace(/_/g, '-');
+  if (raw === 'eigen') return discoverSources('eigen-session').concat(discoverSources('eigen-task'));
+  const adapter = resolveAdapter(runtimeOrAdapter);
+  if (adapter.name === 'claude') {
+    if (!fs.existsSync(PROJECTS_DIR)) return [];
+    return fs.readdirSync(PROJECTS_DIR).flatMap(name => {
+      const dir = path.join(PROJECTS_DIR, name);
+      try { if (!fs.statSync(dir).isDirectory()) return []; } catch { return []; }
+      return fs.readdirSync(dir)
+        .filter(f => f.endsWith('.jsonl'))
+        .map(f => ({ adapter: 'claude', runtime: 'claude', source: path.join(dir, f), cwd: dirCwd(dir) }));
+    }).filter(s => s.cwd);
+  }
+  if (adapter.name === 'codex') {
+    // Codex names rollouts rollout-*.jsonl; older/alt layouts use session-*.jsonl.
+    // The parser handles both via session_meta, so accept either on discovery.
+    return walkFiles(CODEX_SESSIONS_DIR, (_p, name) => /^(rollout|session)-.*\.jsonl$/.test(name))
+      .map(source => ({ adapter: 'codex', runtime: 'codex', source }));
+  }
+  if (adapter.name === 'eigen-session') {
+    return walkFiles(EIGEN_DIR, (p, name) => name.endsWith('.jsonl') && p.includes(`${path.sep}sessions${path.sep}`) && !name.endsWith('.meta.json'))
+      .map(source => ({ adapter: 'eigen-session', runtime: 'eigen', sourceKind: 'session', source }));
+  }
+  if (adapter.name === 'eigen-task') {
+    return walkFiles(path.join(EIGEN_DIR, 'tasks'), (_p, name) => name.endsWith('.transcript.jsonl'))
+      .map(source => ({ adapter: 'eigen-task', runtime: 'eigen', sourceKind: 'task', source }));
+  }
+  return [];
+}
+
+function valueAfter(args, name) {
+  const prefix = `${name}=`;
+  const inline = args.find(a => a.startsWith(prefix));
+  if (inline) return inline.slice(prefix.length);
+  const idx = args.indexOf(name);
+  return idx === -1 ? undefined : args[idx + 1];
 }
 
 function main() {
   const args = process.argv.slice(2);
   const force = args.includes('--force');
+  const source = valueAfter(args, '--source');
+  const runtime = valueAfter(args, '--runtime') || 'claude';
+  const discover = args.includes('--discover');
+  const cwd = valueAfter(args, '--cwd');
+  const gitBranch = valueAfter(args, '--branch');
+  const gitBranchSource = valueAfter(args, '--branch-source');
+  if (source || discover) {
+    const sources = source ? [{ source, cwd }] : discoverSources(runtime);
+    if (discover && !sources.length) {
+      console.log(`no sources discovered for ${runtime}`);
+      return;
+    }
+    let built = 0, skipped = 0, errored = 0, records = 0;
+    for (const item of sources) {
+      try {
+        const r = ingestSourceWithCursor({
+          runtime: item.adapter || runtime,
+          source: item.source,
+          cwd: item.cwd || cwd,
+          gitBranch,
+          gitBranchSource,
+          cursor: args.includes('--cursor'),
+          allowUnlisted: args.includes('--allow-unlisted'),
+        });
+        if (r.skipped) { skipped++; if (!discover) console.log(`skipped ${item.source}: ${r.reason} (${r.cwd})`); }
+        else {
+          built++;
+          records += r.records;
+          console.log(`cursor-ingested ${r.records} records from ${r.rows} row(s) via ${r.adapter} → ${r.key} (${r.cwd}) offset=${r.offset}`);
+        }
+      } catch (e) {
+        errored++;
+        console.error(`cursor ingest failed for ${item.source}: ${e.message}`);
+        if (!discover) process.exit(1);
+      }
+    }
+    if (discover) console.log(`discover ingest done: ${built} ingested, ${skipped} skipped, ${errored} errored, ${records} records`);
+    if (errored && !built && !skipped) process.exit(1);
+    if (!discover && errored) process.exit(1);
+    if (!discover && skipped) return;
+    if (!discover) {
+      // single-source success already printed above
+    }
+    return;
+  }
   const target = args.find(a => !a.startsWith('--'));
 
   // Explicit single-cwd mode: map cwd→dir by re-dashing (force rebuild).
@@ -208,7 +516,6 @@ function main() {
 
   const prefixes = allowlist();
   if (!prefixes.length) { console.log('no projects in allowlist'); return; }
-  if (!fs.existsSync(PROJECTS_DIR)) { console.log(`no transcript directory at ${PROJECTS_DIR}`); return; }
 
   let built = 0, skipped = 0, nomatch = 0, errored = 0;
   for (const name of fs.readdirSync(PROJECTS_DIR)) {
@@ -227,7 +534,7 @@ function main() {
       console.log(`error ${name}: ${e.message}`);
     }
   }
-  console.log(`done: ${built} built, ${skipped} unchanged, ${nomatch} outside allowlist, ${errored} errored`);
+  console.log(`done: ${built} built, ${skipped} unchanged, ${nomatch} outside allowlist, ${errored} errored (${ORIENTATION_HOME})`);
 }
 
 main();

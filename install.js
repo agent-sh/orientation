@@ -1,121 +1,207 @@
 #!/usr/bin/env node
-// orientation installer - places the engine, the skill, and wires the Claude Code
-// hooks. Idempotent: safe to re-run; never duplicates hooks or clobbers unrelated
-// settings. Run automatically on `npm install`, or manually: `node install.js`.
+// orientation installer/sync tool.
 //
-// What it does:
-//   1. copy src/*.js + refresh.sh        -> runtime home
-//   2. copy skill/get-oriented/SKILL.md  -> Claude skills directory
-//   3. seed projects.txt (allowlist)     -> runtime home (if absent)
-//   4. wire SessionStart, Stop, PreCompact hooks -> Claude settings.json
-//
-// Defaults match Claude Code's standard config layout. Set CLAUDE_CONFIG_DIR or
-// ORIENTATION_HOME before install to target another location.
+// Idempotently syncs the local engine and get-oriented skill into:
+//   - Codex:  ~/.codex/skills/get-oriented plus ~/.eigen/orientation runtime
+//   - Claude: ~/.claude/skills/get-oriented plus ~/.claude/action-graph runtime
+//   - Eigen:  ~/.eigen/skills/get-oriented plus ~/.eigen/orientation runtime/hooks
 
 const fs = require('fs');
 const path = require('path');
-const { CLAUDE, ACTION_GRAPH: AG } = require('./src/paths');
+const os = require('os');
+const { spawnSync } = require('child_process');
 
-const HERE = __dirname;
-const SKILLS = path.join(CLAUDE, 'skills', 'get-oriented');
-const SETTINGS = path.join(CLAUDE, 'settings.json');
+const PKG = __dirname;
+const SRC = path.join(PKG, 'src');
+const SKILL = path.join(PKG, 'skills', 'get-oriented', 'SKILL.md');
+const PROJECTS_EXAMPLE = path.join(PKG, 'projects.txt.example');
+const HOME = os.homedir();
 
-// Resolve the node binary the hooks should call (absolute, for hook reliability).
+const CODEX = process.env.CODEX_HOME || path.join(HOME, '.codex');
+const CLAUDE = process.env.CLAUDE_CONFIG_DIR || path.join(HOME, '.claude');
+const EIGEN = process.env.EIGEN_HOME || path.join(HOME, '.eigen');
+
+const CODEX_ENGINE = process.env.EIGEN_ORIENTATION_DIR || path.join(EIGEN, 'orientation');
+const CLAUDE_ENGINE = path.join(CLAUDE, 'action-graph');
+const EIGEN_SKILL = path.join(EIGEN, 'skills', 'get-oriented');
+const CODEX_SKILL = path.join(CODEX, 'skills', 'get-oriented');
+const CLAUDE_SKILL = path.join(CLAUDE, 'skills', 'get-oriented');
+
 const NODE = process.execPath;
 
-function log(m) { console.log(`[orientation] ${m}`); }
-
-function copyEngine() {
-  fs.mkdirSync(path.join(AG, 'data'), { recursive: true });
-  const src = path.join(HERE, 'src');
-  for (const f of fs.readdirSync(src)) {
-    fs.copyFileSync(path.join(src, f), path.join(AG, f));
-    if (f.endsWith('.sh')) fs.chmodSync(path.join(AG, f), 0o755);
-  }
-  log(`engine → ${AG}`);
+function log(message) {
+  console.log(`[orientation] ${message}`);
 }
 
-function copySkill() {
-  fs.mkdirSync(SKILLS, { recursive: true });
-  fs.copyFileSync(path.join(HERE, 'skill', 'get-oriented', 'SKILL.md'), path.join(SKILLS, 'SKILL.md'));
-  log(`skill → ${SKILLS}`);
+function usage() {
+  console.log(`usage:
+  node install.js [--all|--codex|--claude|--eigen] [--no-hooks] [--dry-run]
+
+defaults:
+  node install.js              same as --all
+
+targets:
+  --codex                      sync Codex skill and ~/.eigen/orientation runtime
+  --claude                     sync Claude skill, ~/.claude/action-graph runtime, hooks
+  --eigen                      sync Eigen skill/runtime/hooks
+  --all                        sync all targets
+
+environment:
+  CODEX_HOME                   default ${CODEX}
+  CLAUDE_CONFIG_DIR            default ${CLAUDE}
+  EIGEN_HOME                   default ${EIGEN}
+  EIGEN_ORIENTATION_DIR        default ${CODEX_ENGINE}`);
 }
 
-function seedAllowlist() {
-  const dst = path.join(AG, 'projects.txt');
-  if (fs.existsSync(dst)) { log('projects.txt exists — left as-is'); return; }
-  const example = path.join(HERE, 'projects.txt.example');
-  if (fs.existsSync(example)) fs.copyFileSync(example, dst);
-  else fs.writeFileSync(dst, '# orientation allowlist — one cwd PREFIX per line.\n# e.g. /home/you/projects\n');
-  log(`projects.txt seeded → ${dst} (edit to opt projects in)`);
-}
+function parseArgs(argv) {
+  const targets = new Set();
+  let hooks = true;
+  let dryRun = false;
 
-function normalized(s) {
-  return String(s || '').replace(/\\/g, '/');
-}
-
-function isOwnedHook(command, scriptName, desiredCommand) {
-  const s = normalized(command);
-  const desired = normalized(desiredCommand);
-  return s === desired ||
-    s.includes('ORIENTATION_HOOK=1') ||
-    (s.includes('/action-graph/') && s.includes(`/${scriptName}`));
-}
-
-function sameHook(hook, desired) {
-  return hook.type === desired.type &&
-    hook.command === desired.command &&
-    hook.timeout === desired.timeout &&
-    hook.statusMessage === desired.statusMessage;
-}
-
-// Wire or repair a command hook into one event without disturbing unrelated hooks.
-function ensureHook(hooks, event, scriptName, command, extra = {}) {
-  hooks[event] = hooks[event] || [];
-  const desired = { type: 'command', command, ...extra };
-  for (const grp of hooks[event]) {
-    for (const h of (grp.hooks || [])) {
-      if (typeof h.command !== 'string' || !isOwnedHook(h.command, scriptName, command)) continue;
-      if (sameHook(h, desired)) return false;
-      Object.assign(h, desired);
-      return true;
+  for (const arg of argv) {
+    if (arg === '--help' || arg === '-h') {
+      usage();
+      process.exit(0);
+    } else if (arg === '--all') {
+      targets.add('codex');
+      targets.add('claude');
+      targets.add('eigen');
+    } else if (arg === '--codex') {
+      targets.add('codex');
+    } else if (arg === '--claude') {
+      targets.add('claude');
+    } else if (arg === '--eigen') {
+      targets.add('eigen');
+    } else if (arg === '--no-hooks') {
+      hooks = false;
+    } else if (arg === '--dry-run') {
+      dryRun = true;
+    } else {
+      throw new Error(`unknown option: ${arg}`);
     }
   }
-  hooks[event].push({ hooks: [desired] });
-  return true;
+
+  if (!targets.size) {
+    targets.add('codex');
+    targets.add('claude');
+    targets.add('eigen');
+  }
+
+  return { targets, hooks, dryRun };
 }
 
-function wireHooks() {
-  let settings = {};
-  if (fs.existsSync(SETTINGS)) {
-    try { settings = JSON.parse(fs.readFileSync(SETTINGS, 'utf8')); }
-    catch { log('settings.json unparseable — skipping hook wiring; wire manually (see README)'); return; }
+function mkdir(dir, dryRun) {
+  if (dryRun) {
+    log(`would create ${dir}`);
+    return;
   }
-  settings.hooks = settings.hooks || {};
+  fs.mkdirSync(dir, { recursive: true });
+}
 
-  const consume = `ORIENTATION_HOOK=1 "${NODE}" "${path.join(AG, 'consume.js')}"`;
-  const refresh = `ORIENTATION_HOOK=1 bash "${path.join(AG, 'refresh.sh')}"`;
-
-  let n = 0;
-  if (ensureHook(settings.hooks, 'SessionStart', 'consume.js', consume, { timeout: 5, statusMessage: 'Loading orientation...' })) n++;
-  if (ensureHook(settings.hooks, 'Stop', 'refresh.sh', refresh, { timeout: 60 })) n++;
-  if (ensureHook(settings.hooks, 'PreCompact', 'refresh.sh', refresh, { timeout: 60 })) n++;
-
-  if (n) {
-    fs.writeFileSync(SETTINGS, JSON.stringify(settings, null, 2));
-    log(`wired ${n} hook(s) → ${SETTINGS}`);
-  } else {
-    log('hooks already present — settings untouched');
+function copyFile(src, dst, dryRun) {
+  if (dryRun) {
+    log(`would copy ${src} -> ${dst}`);
+    return;
   }
+  fs.mkdirSync(path.dirname(dst), { recursive: true });
+  fs.copyFileSync(src, dst);
+  if (src.endsWith('.sh') || path.basename(src) === 'orientation') {
+    fs.chmodSync(dst, 0o755);
+  }
+}
+
+function copyEngine(dst, dryRun) {
+  mkdir(dst, dryRun);
+  for (const name of fs.readdirSync(SRC)) {
+    const src = path.join(SRC, name);
+    const st = fs.statSync(src);
+    if (!st.isFile()) continue;
+    copyFile(src, path.join(dst, name), dryRun);
+  }
+  seedProjects(dst, dryRun);
+  log(`engine -> ${dst}`);
+}
+
+function copySkill(dst, dryRun) {
+  mkdir(dst, dryRun);
+  copyFile(SKILL, path.join(dst, 'SKILL.md'), dryRun);
+  log(`skill -> ${dst}`);
+}
+
+function readSeed() {
+  try {
+    return fs.readFileSync(PROJECTS_EXAMPLE, 'utf8');
+  } catch {
+    return '# orientation allowlist - one cwd prefix per line.\n# e.g. /home/you/projects\n';
+  }
+}
+
+function seedProjects(engineDir, dryRun) {
+  const dst = path.join(engineDir, 'projects.txt');
+  if (dryRun) {
+    log(fs.existsSync(dst) ? `projects.txt exists -> ${dst}` : `would seed ${dst}`);
+    return;
+  }
+  // Exclusive create ('wx'): never clobbers an existing allowlist and is atomic,
+  // so there is no check-then-write TOCTOU window.
+  try {
+    fs.writeFileSync(dst, readSeed(), { flag: 'wx' });
+    log(`projects.txt seeded -> ${dst}`);
+  } catch (err) {
+    if (err.code === 'EEXIST') { log(`projects.txt exists -> ${dst}`); return; }
+    throw err;
+  }
+}
+
+function runHookManager(engineDir, runtime, dryRun) {
+  const script = path.join(engineDir, 'hooks.js');
+  const env = {
+    ...process.env,
+    ORIENTATION_HOME: engineDir,
+    ORIENTATION_ENGINE_DIR: engineDir,
+  };
+  const args = [script, 'install', '--runtime', runtime];
+  if (dryRun) {
+    log(`would run ${NODE} ${args.join(' ')}`);
+    return;
+  }
+  const result = spawnSync(NODE, args, { stdio: 'inherit', env });
+  if (result.status !== 0) {
+    throw new Error(`hook install failed for ${runtime}`);
+  }
+}
+
+function syncCodex(opts) {
+  copyEngine(CODEX_ENGINE, opts.dryRun);
+  copySkill(CODEX_SKILL, opts.dryRun);
+  copySkill(EIGEN_SKILL, opts.dryRun);
+  if (opts.hooks) runHookManager(CODEX_ENGINE, 'eigen', opts.dryRun);
+}
+
+function syncClaude(opts) {
+  copyEngine(CLAUDE_ENGINE, opts.dryRun);
+  copySkill(CLAUDE_SKILL, opts.dryRun);
+  if (opts.hooks) runHookManager(CLAUDE_ENGINE, 'claude-code', opts.dryRun);
+}
+
+function syncEigen(opts) {
+  copyEngine(CODEX_ENGINE, opts.dryRun);
+  copySkill(EIGEN_SKILL, opts.dryRun);
+  if (opts.hooks) runHookManager(CODEX_ENGINE, 'eigen', opts.dryRun);
 }
 
 function main() {
-  log('installing...');
-  copyEngine();
-  copySkill();
-  seedAllowlist();
-  wireHooks();
-  log('done. Edit ' + path.join(AG, 'projects.txt') + ' to opt projects in, then work normally.');
+  const opts = parseArgs(process.argv.slice(2));
+  log(`syncing from ${PKG}`);
+  if (opts.targets.has('codex')) syncCodex(opts);
+  if (opts.targets.has('claude')) syncClaude(opts);
+  if (opts.targets.has('eigen') && !opts.targets.has('codex')) syncEigen(opts);
+  log('done');
 }
 
-main();
+try {
+  main();
+} catch (error) {
+  console.error(`[orientation] ${error.message}`);
+  process.exit(1);
+}

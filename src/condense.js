@@ -5,7 +5,10 @@
 
 const fs = require('fs');
 const path = require('path');
-const { DATA: ROOT } = require('./paths');
+const crypto = require('crypto');
+const { DATA_DIR } = require('./state');
+
+const ROOT = DATA_DIR;
 
 function loadRaw(dir) {
   const f = path.join(dir, 'raw.jsonl');
@@ -26,10 +29,35 @@ function splitEpisodes(events) {
   let cur = null;
   for (const e of events) {
     if (e.kind === 'intent') {
-      cur = { intent: e.text, t: e.t, session: e.session, events: [] };
+      cur = {
+        intent: e.text,
+        t: e.t,
+        session: e.session,
+        runtime: e.runtime,
+        adapter: e.adapter,
+        sourceKind: e.sourceKind,
+        gitBranch: e.gitBranch,
+        gitBranchSource: e.gitBranchSource,
+        flow: e.flow,
+        events: [e],
+      };
       eps.push(cur);
     } else {
-      if (!cur) { cur = { intent: null, t: e.t, session: e.session, events: [] }; eps.push(cur); }
+      if (!cur) {
+        cur = {
+          intent: null,
+          t: e.t,
+          session: e.session,
+          runtime: e.runtime,
+          adapter: e.adapter,
+          sourceKind: e.sourceKind,
+          gitBranch: e.gitBranch,
+          gitBranchSource: e.gitBranchSource,
+          flow: e.flow,
+          events: [],
+        };
+        eps.push(cur);
+      }
       cur.events.push(e);
     }
   }
@@ -85,12 +113,66 @@ function condenseEpisode(ep) {
   const runs = [];              // notable commands (test/build/commit/push)
   const delegates = [];
   const skills = [];
+  const runtimes = [];
+  const adapters = [];
+  const sourceKinds = [];
+  const gitBranches = [];
+  const gitBranchSources = [];
+  const branchEvents = [];
+  const sources = [];
+  const projectKeys = [];
+  const projectKeyVersions = [];
+  const legacyProjectKeys = [];
+  const repoKeys = [];
+  const repoRoots = [];
+  const gitRemotes = [];
+  const worktreeCwds = [];
+  const headShas = [];
+  const headShaSources = [];
+  const evidence = [];
   let exploreCount = 0;
   const exploreFiles = new Set();
   let deadEnds = 0;
   const reasons = [];
 
   for (const e of ep.events) {
+    if (e.runtime) runtimes.push(e.runtime);
+    if (e.adapter) adapters.push(e.adapter);
+    if (e.sourceKind) sourceKinds.push(e.sourceKind);
+    if (e.gitBranch) {
+      gitBranches.push(e.gitBranch);
+      branchEvents.push({
+        branch: e.gitBranch,
+        source: e.gitBranchSource || null,
+        t: e.t,
+        session: e.session,
+        runtime: e.runtime,
+      });
+    }
+    if (e.gitBranchSource) gitBranchSources.push(e.gitBranchSource);
+    if (e.source) sources.push(e.source);
+    if (e.projectKey) projectKeys.push(e.projectKey);
+    if (e.projectKeyVersion) projectKeyVersions.push(e.projectKeyVersion);
+    if (e.legacyProjectKey) legacyProjectKeys.push(e.legacyProjectKey);
+    if (e.repoKey) repoKeys.push(e.repoKey);
+    if (e.repoRoot) repoRoots.push(e.repoRoot);
+    if (e.gitRemote) gitRemotes.push(e.gitRemote);
+    if (e.worktreeCwd) worktreeCwds.push(e.worktreeCwd);
+    if (e.headSha) headShas.push(e.headSha);
+    if (e.headShaSource) headShaSources.push(e.headShaSource);
+    if (e.source || e.session || e.runtime) evidence.push({
+      runtime: e.runtime,
+      adapter: e.adapter,
+      sourceKind: e.sourceKind,
+      session: e.session,
+      source: e.source,
+      sourceLine: e.sourceLine,
+      sourceOffset: e.sourceOffset,
+      t: e.t,
+      kind: e.kind,
+      gitBranch: e.gitBranch,
+      gitBranchSource: e.gitBranchSource,
+    });
     if (e.kind === 'explore') {
       exploreCount++;
       (e.files || []).forEach(f => f && exploreFiles.add(base(f)));
@@ -124,10 +206,30 @@ function condenseEpisode(ep) {
   for (const r of runs) lastByKey.set(r.kind + '|' + (r.cmd || ''), r);
   const uniqRuns = [...lastByKey.values()];
 
-  return {
+  const branches = dedupeBranchHistory(branchEvents);
+  const lastBranch = last(branches);
+  const rec = {
     intent: ep.intent,
     t: ep.t,
     session: ep.session,
+    runtime: mostCommon(runtimes) || ep.runtime || 'claude',
+    adapter: mostCommon(adapters) || ep.adapter,
+    sourceKind: mostCommon(sourceKinds) || ep.sourceKind,
+    gitBranch: lastBranch?.branch || last(gitBranches) || ep.gitBranch,
+    gitBranchSource: lastBranch?.source || last(gitBranchSources) || ep.gitBranchSource,
+    branchHistory: branches,
+    flow: ep.flow,
+    projectKey: mostCommon(projectKeys),
+    projectKeyVersion: mostCommon(projectKeyVersions),
+    legacyProjectKey: mostCommon(legacyProjectKeys),
+    repoKey: mostCommon(repoKeys),
+    repoRoot: mostCommon(repoRoots),
+    gitRemote: mostCommon(gitRemotes),
+    worktreeCwd: mostCommon(worktreeCwds),
+    headSha: last(headShas),
+    headShaSource: last(headShaSources),
+    sources: [...new Set(sources)].slice(0, 8),
+    evidence: dedupeEvidence(evidence).slice(0, 12),
     filesTouched: [...files.keys()],
     explored: exploreCount ? { count: exploreCount, files: [...exploreFiles].slice(0, 8) } : null,
     runs: uniqRuns,
@@ -136,6 +238,55 @@ function condenseEpisode(ep) {
     deadEnds,
     prose: prose(ep.intent, files, uniqRuns, exploreCount, delegates, deadEnds, reasons, ep.continued),
   };
+  rec.id = episodeId(rec);
+  return rec;
+}
+
+function last(xs) { return xs.length ? xs[xs.length - 1] : undefined; }
+
+function mostCommon(xs) {
+  const counts = new Map();
+  for (const x of xs.filter(Boolean)) counts.set(x, (counts.get(x) || 0) + 1);
+  return [...counts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0];
+}
+
+function dedupeEvidence(items) {
+  const seen = new Set();
+  const out = [];
+  for (const e of items) {
+    const key = [e.runtime, e.session, e.source, e.sourceLine, e.sourceOffset, e.kind].join('|');
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(e);
+  }
+  return out;
+}
+
+function dedupeBranchHistory(items) {
+  const out = [];
+  let prev = null;
+  for (const item of items) {
+    if (!item.branch) continue;
+    const next = {
+      branch: item.branch,
+      source: item.source,
+      t: item.t,
+      session: item.session,
+      runtime: item.runtime,
+    };
+    const key = [next.branch, next.source, next.session, next.runtime].join('|');
+    if (key === prev) continue;
+    prev = key;
+    out.push(next);
+  }
+  return out.slice(-12);
+}
+
+function episodeId(ep) {
+  return crypto.createHash('sha1')
+    .update([ep.t, ep.session, ep.runtime, ep.intent, ep.sources && ep.sources[0], ep.filesTouched.join(',')].filter(Boolean).join('|'))
+    .digest('hex')
+    .slice(0, 12);
 }
 
 // Template prose — the "least but enough" line a future session reads.
