@@ -1,0 +1,38 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "mkdir -p \"${CLAUDE_PLUGIN_DATA}\" && ORIENTATION_HOOK=1 ORIENTATION_HOME=\"${CLAUDE_PLUGIN_DATA}\" ORIENTATION_ENGINE_DIR=\"${CLAUDE_PLUGIN_ROOT}/src\" node \"${CLAUDE_PLUGIN_ROOT}/src/consume.js\"",
+            "timeout": 5,
+            "statusMessage": "Loading orientation..."
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "mkdir -p \"${CLAUDE_PLUGIN_DATA}\" && ORIENTATION_HOOK=1 ORIENTATION_HOME=\"${CLAUDE_PLUGIN_DATA}\" ORIENTATION_ENGINE_DIR=\"${CLAUDE_PLUGIN_ROOT}/src\" node \"${CLAUDE_PLUGIN_ROOT}/src/hook.js\"",
+            "timeout": 20
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "mkdir -p \"${CLAUDE_PLUGIN_DATA}\" && ORIENTATION_HOOK=1 ORIENTATION_HOME=\"${CLAUDE_PLUGIN_DATA}\" ORIENTATION_ENGINE_DIR=\"${CLAUDE_PLUGIN_ROOT}/src\" node \"${CLAUDE_PLUGIN_ROOT}/src/hook.js\"",
+            "timeout": 20
+          }
+        ]
+      }
+    ]
+  }
+}

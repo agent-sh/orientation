@@ -41,7 +41,12 @@ function inferCwd(runtimeOrAdapter, rows, meta = {}) {
     const sm = rows.find(r => r && r.type === 'session_meta' && r.payload);
     return sm?.payload?.cwd || null;
   }
-  return eigenMeta(meta.source).dir || null;
+  // Eigen: prefer the meta sidecar, then fall back to any in-band row that
+  // carries a cwd/dir (a misnamed or missing meta file must not strand ingest).
+  const metaDir = eigenMeta(meta.source).dir;
+  if (metaDir) return metaDir;
+  const inband = rows.find(r => r && (r.cwd || r.dir || r.payload?.cwd || r.payload?.dir));
+  return inband ? (inband.cwd || inband.dir || inband.payload?.cwd || inband.payload?.dir) : null;
 }
 
 function parseClaudeRows(rows, meta = {}) {

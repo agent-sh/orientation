@@ -17,13 +17,29 @@ The engine is plain Node.js, has no runtime dependencies, and does not call a mo
 
 This repository is ready for public GitHub use and local installation from GitHub. The package name is reserved in `package.json` as `@agent-sh/orientation`, but it is not published to npm yet.
 
+orientation installs two ways from one repo:
+
+- **Claude Code marketplace plugin** - `/plugin install` copies the bundled engine, the `get-oriented` skill, and declarative `SessionStart`/`Stop`/`PreCompact` hooks. State is written to the plugin's data dir; no npm step runs.
+- **npm package** - `npm i -g` runs `install.js`, which copies the engine + skill and wires hooks for Claude Code (`settings.json`), Codex (harness-owned contract printed), and Eigen (`hooks.json`).
+
 Current host support:
 
-- Claude Code: installer copies the engine, installs the skill, and wires `SessionStart`, `Stop`, and `PreCompact` hooks in `settings.json`.
+- Claude Code: marketplace plugin OR installer; copies the engine, installs the skill, wires `SessionStart`, `Stop`, and `PreCompact` hooks.
 - Codex: installer copies the engine and skill; Codex hooks are harness-owned, so the installer prints the hook contract to wire into your harness instead of editing config.
 - Eigen: installer copies the engine and skill and wires the `turn_done`, `session_stop`, and `note` hooks in `hooks.json`.
 
-## Install
+## Install (Claude Code marketplace)
+
+The simplest path for Claude Code - no npm, no postinstall:
+
+```text
+/plugin marketplace add agent-sh/agentsys
+/plugin install orientation@agentsys
+```
+
+The plugin bundles the engine under `src/`, the skill under `skills/get-oriented/`, and `hooks/hooks.json`. Hooks run the bundled engine with `ORIENTATION_ENGINE_DIR=${CLAUDE_PLUGIN_ROOT}/src` and write graph data to the plugin's persistent data dir (`${CLAUDE_PLUGIN_DATA}`), so nothing touches `~/.claude/action-graph`. With an empty allowlist it indexes every project; add prefixes to `projects.txt` in the data dir to scope it.
+
+## Install (npm)
 
 Install directly from GitHub:
 
@@ -194,6 +210,11 @@ It checks:
 - resume-thread scoring invariants
 - the Codex `apply_patch` adapter records touched files
 - multi-runtime install into temp Claude/Codex/Eigen homes (never touches your real config)
+- hook wiring: the `ORIENTATION_HOOK=1` sentinel is present, unrelated user hooks survive, re-install is idempotent (0 changed), and `remove` is a clean inverse
+- live hook fire: a wired `hook.js` actually ingests a synthetic transcript and rebuilds the graph; `consume.js` emits the history pointer
+- subcommand smoke (`query`, `status`, `doctor`, `coupled`)
+- plugin shape: `.claude-plugin/plugin.json` and `hooks/hooks.json` resolve the engine via `${CLAUDE_PLUGIN_ROOT}` and write to `${CLAUDE_PLUGIN_DATA}`
+- `projects.txt.example` stays generic (no leaked user path)
 - `get-oriented` frontmatter portability, including replaying the old failing `allowed-tools` shape
 - agnix validation for Claude Code and Codex when `agnix` is installed
 

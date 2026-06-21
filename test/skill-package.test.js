@@ -7,7 +7,7 @@ const path = require('path');
 const { spawnSync } = require('child_process');
 
 const ROOT = path.resolve(__dirname, '..');
-const SKILL_DIR = path.join(ROOT, 'skill', 'get-oriented');
+const SKILL_DIR = path.join(ROOT, 'skills', 'get-oriented');
 const SKILL_MD = path.join(SKILL_DIR, 'SKILL.md');
 const AGNIX_CONFIG = path.join(SKILL_DIR, '.agnix.toml');
 const ALLOWED_FRONTMATTER_KEYS = new Set(['name', 'description']);
@@ -116,6 +116,27 @@ function main() {
     'Frontmatter Safety',
   ]) {
     assert(text.includes(needle), `skill body keeps ${needle}`);
+  }
+
+  // Allowlist example must stay generic - never leak a concrete Linux user path.
+  const example = fs.readFileSync(path.join(ROOT, 'projects.txt.example'), 'utf8');
+  assert(example.includes('/home/you/projects'), 'projects.txt.example keeps the generic /home/you/projects sample');
+  assert(!/\/home\/(?!you\/)[^/\n]+\/projects/.test(example), 'projects.txt.example leaks no concrete user path');
+
+  // Claude Code plugin shape: manifest + declarative hooks present and valid, so
+  // a marketplace /plugin install delivers a working plugin (no npm postinstall).
+  const pluginJsonPath = path.join(ROOT, '.claude-plugin', 'plugin.json');
+  assert(fs.existsSync(pluginJsonPath), 'plugin manifest .claude-plugin/plugin.json exists');
+  const pluginJson = JSON.parse(fs.readFileSync(pluginJsonPath, 'utf8'));
+  assert(pluginJson.name === 'orientation', 'plugin.json name is orientation');
+  assert(fs.existsSync(path.join(ROOT, 'skills', 'get-oriented', 'SKILL.md')), 'plugin auto-discovery skills/get-oriented/SKILL.md exists');
+  const hooksJsonPath = path.join(ROOT, 'hooks', 'hooks.json');
+  assert(fs.existsSync(hooksJsonPath), 'plugin hooks/hooks.json exists');
+  const hooksJson = JSON.parse(fs.readFileSync(hooksJsonPath, 'utf8'));
+  for (const ev of ['SessionStart', 'Stop', 'PreCompact']) {
+    const cmds = (hooksJson.hooks?.[ev] || []).flatMap(g => g.hooks || []).map(h => h.command || '');
+    assert(cmds.some(c => c.includes('CLAUDE_PLUGIN_ROOT') && c.includes('CLAUDE_PLUGIN_DATA')),
+      `hooks.json ${ev} resolves engine via CLAUDE_PLUGIN_ROOT + writable CLAUDE_PLUGIN_DATA`);
   }
 
   if (!agnixAvailable()) {

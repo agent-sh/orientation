@@ -10,7 +10,7 @@
 //   node ingest.js --runtime claude|codex|eigen --source <jsonl> --cwd <cwd> --cursor
 //                             → append only new records from one transcript
 //
-// Allowlist entries are cwd PREFIXES. A line `/home/avifenesh/projects` matches
+// Allowlist entries are cwd PREFIXES. A line `/home/you/projects` matches
 // every project (and nested repo) under it — each distinct session cwd becomes its
 // own project. Discovery reads the real cwd from each transcript (dir-name dashing
 // is ambiguous); incremental skip via per-project mtime manifest keeps Stop fast
@@ -335,7 +335,10 @@ function ingestSourceWithCursor(opts) {
   const cwd = opts.cwd || cursor?.cwd
     || inferCwd(adapter.name, chunk.rows, { source: opts.source })
     || sourceCwd(opts.source, adapter.name);
-  if (!cwd) throw new Error(`could not determine cwd for ${opts.source}; pass --cwd`);
+  // Soft skip, not throw: a misnamed/missing eigen meta must not crash a hook
+  // (process.exit(1)) on the single-source path. The caller treats skipped
+  // sources as benign and still reports the reason for manual single-source runs.
+  if (!cwd) return { skipped: true, reason: 'could not determine cwd (pass --cwd)', cwd: null, records: 0, rows: chunk.rows.length };
   const identity = inspectProject(cwd);
   const gitBranch = opts.gitBranch || identity.currentBranch || null;
   const gitBranchSource = opts.gitBranch ? (opts.gitBranchSource || 'cli') : (gitBranch ? 'inferred' : null);
@@ -426,7 +429,9 @@ function discoverSources(runtimeOrAdapter) {
     }).filter(s => s.cwd);
   }
   if (adapter.name === 'codex') {
-    return walkFiles(CODEX_SESSIONS_DIR, (_p, name) => /^rollout-.*\.jsonl$/.test(name))
+    // Codex names rollouts rollout-*.jsonl; older/alt layouts use session-*.jsonl.
+    // The parser handles both via session_meta, so accept either on discovery.
+    return walkFiles(CODEX_SESSIONS_DIR, (_p, name) => /^(rollout|session)-.*\.jsonl$/.test(name))
       .map(source => ({ adapter: 'codex', runtime: 'codex', source }));
   }
   if (adapter.name === 'eigen-session') {

@@ -127,7 +127,15 @@ function run() {
   assert(patch && patch.files.includes('README.md'), 'codex apply_patch input records touched files');
 
   console.log('install invariants:');
-  execFileSync(NODE, [path.join(__dirname, '..', 'install.js'), '--all', '--no-hooks'], {
+  // Install WITH hooks (not --no-hooks) so hook wiring is actually exercised.
+  // Seed an unrelated user hook first; it must survive the install.
+  const claudeSettingsPath = path.join(TEST_ENV.CLAUDE_CONFIG_DIR, 'settings.json');
+  fs.mkdirSync(TEST_ENV.CLAUDE_CONFIG_DIR, { recursive: true });
+  fs.writeFileSync(claudeSettingsPath, JSON.stringify({
+    hooks: { Stop: [{ hooks: [{ type: 'command', command: 'echo unrelated-user-hook', timeout: 3 }] }] },
+  }, null, 2));
+
+  execFileSync(NODE, [path.join(__dirname, '..', 'install.js'), '--all'], {
     encoding: 'utf8',
     env: TEST_ENV,
   });
@@ -136,6 +144,79 @@ function run() {
   assert(fs.existsSync(path.join(TEST_ENV.EIGEN_HOME, 'skills', 'get-oriented', 'SKILL.md')), 'eigen skill installed');
   assert(fs.existsSync(path.join(TEST_ENV.EIGEN_HOME, 'orientation', 'consume.js')), 'eigen orientation engine installed');
   assert(fs.existsSync(path.join(TEST_ENV.CLAUDE_CONFIG_DIR, 'action-graph', 'consume.js')), 'claude orientation engine installed');
+
+  console.log('hook wiring invariants:');
+  const ownedClaude = (settings) => ['SessionStart', 'Stop', 'PreCompact'].map(ev =>
+    (settings.hooks?.[ev] || []).flatMap(g => g.hooks || []).filter(h => /ORIENTATION_HOOK=1/.test(h.command || '')));
+  let claudeSettings = JSON.parse(fs.readFileSync(claudeSettingsPath, 'utf8'));
+  const [ss, stop, pre] = ownedClaude(claudeSettings);
+  assert(ss.length === 1 && /consume\.js/.test(ss[0].command), 'SessionStart wires consume.js with ORIENTATION_HOOK=1 sentinel');
+  assert(stop.length === 1 && /hook\.js/.test(stop[0].command), 'Stop wires hook.js with sentinel');
+  assert(pre.length === 1 && /hook\.js/.test(pre[0].command), 'PreCompact wires hook.js with sentinel');
+  // unrelated user hook preserved
+  const unrelated = (claudeSettings.hooks.Stop || []).flatMap(g => g.hooks || []).filter(h => h.command === 'echo unrelated-user-hook');
+  assert(unrelated.length === 1, 'unrelated user Stop hook preserved through install');
+  // eigen hooks.json wired
+  const eigenHooksPath = path.join(TEST_ENV.EIGEN_HOME, 'hooks.json');
+  assert(fs.existsSync(eigenHooksPath), 'eigen hooks.json written');
+  const eigenCfg = JSON.parse(fs.readFileSync(eigenHooksPath, 'utf8'));
+  const eigenEvents = new Set((eigenCfg.hooks || []).map(h => h.event));
+  assert(['turn_done', 'session_stop', 'note'].every(e => eigenEvents.has(e)), 'eigen turn_done/session_stop/note wired');
+
+  console.log('idempotency invariants:');
+  // Re-running install must change nothing (0 changed) and not duplicate hooks.
+  const rerun = execFileSync(NODE, [path.join(__dirname, '..', 'install.js'), '--claude'], { encoding: 'utf8', env: TEST_ENV });
+  assert(/already present|\(0 changed\)/.test(rerun), 'claude hook re-install reports 0 changed (idempotent)');
+  claudeSettings = JSON.parse(fs.readFileSync(claudeSettingsPath, 'utf8'));
+  const [ss2, stop2, pre2] = ownedClaude(claudeSettings);
+  assert(ss2.length === 1 && stop2.length === 1 && pre2.length === 1, 'no duplicate orientation hooks after re-install');
+
+  console.log('live hook fire invariants:');
+  // Build a minimal real Claude transcript and fire the wired Stop hook (hook.js)
+  // the way the harness does: cwd + transcript_path on stdin. allowUnlisted so the
+  // fresh allowlist does not gate it. Then assert it ingested + rebuilt the graph.
+  const HOOK_CWD = path.join(TEST_HOME, 'hookproj');
+  fs.mkdirSync(HOOK_CWD, { recursive: true });
+  const transcript = path.join(TEST_HOME, 'transcript.jsonl');
+  const tRows = [
+    { type: 'user', cwd: HOOK_CWD, timestamp: T, message: { content: [{ type: 'text', text: 'add a healthcheck endpoint to the server' }] } },
+    { type: 'assistant', uuid: 'u-aaaaaaaaaaaa', timestamp: T, message: { content: [{ type: 'tool_use', id: 'tu1', name: 'Edit', input: { file_path: 'src/server.js' } }] } },
+    { type: 'user', cwd: HOOK_CWD, timestamp: T, message: { content: [{ type: 'tool_result', tool_use_id: 'tu1', content: 'ok' }] } },
+  ];
+  fs.writeFileSync(transcript, tRows.map(r => JSON.stringify(r)).join('\n') + '\n');
+  const claudeEngine = path.join(TEST_ENV.CLAUDE_CONFIG_DIR, 'action-graph');
+  const HOOK_ENV = { ...TEST_ENV, ORIENTATION_HOME: claudeEngine, ORIENTATION_ENGINE_DIR: claudeEngine, ORIENTATION_HOOK: '1' };
+  execFileSync(NODE, [path.join(claudeEngine, 'hook.js')], {
+    encoding: 'utf8',
+    env: HOOK_ENV,
+    input: JSON.stringify({ cwd: HOOK_CWD, hook_event_name: 'Stop', transcript_path: transcript, session_id: 'selftestsess', allowUnlisted: true }),
+  });
+  const hookKey = projectKey(HOOK_CWD);
+  const hookData = path.join(claudeEngine, 'data', hookKey);
+  assert(fs.existsSync(path.join(hookData, 'raw.jsonl')), 'wired Stop hook ingested transcript to raw.jsonl');
+  assert(fs.existsSync(path.join(hookData, 'graph.json')), 'wired Stop hook rebuilt graph.json');
+  // SessionStart consume.js fires on the same home and emits the history pointer
+  const ssOut = execFileSync(NODE, [path.join(claudeEngine, 'consume.js')], {
+    encoding: 'utf8', env: HOOK_ENV, input: JSON.stringify({ cwd: HOOK_CWD, hook_event_name: 'SessionStart' }),
+  });
+  assert(/get-oriented|goals/.test(ssOut), 'wired SessionStart consume.js emits history pointer once data exists');
+
+  console.log('clean remove invariants:');
+  execFileSync(NODE, [path.join(claudeEngine, 'hooks.js'), 'remove', '--runtime', 'claude-code'], { encoding: 'utf8', env: HOOK_ENV });
+  claudeSettings = JSON.parse(fs.readFileSync(claudeSettingsPath, 'utf8'));
+  const ownedAfter = ownedClaude(claudeSettings).flat();
+  assert(ownedAfter.length === 0, 'remove deletes all orientation hooks');
+  assert(!('SessionStart' in claudeSettings.hooks) && !('PreCompact' in claudeSettings.hooks), 'remove drops emptied event keys (clean inverse)');
+  const survivor = (claudeSettings.hooks.Stop || []).flatMap(g => g.hooks || []).filter(h => h.command === 'echo unrelated-user-hook');
+  assert(survivor.length === 1, 'unrelated user hook survives remove');
+
+  console.log('subcommand smoke invariants:');
+  const bin = path.join(__dirname, '..', 'bin', 'orientation');
+  const smoke = (args) => execFileSync(NODE, [bin, ...args], { encoding: 'utf8', env: HOOK_ENV });
+  assert(/episode\(s\) match|healthcheck/.test(smoke(['query', HOOK_CWD, 'healthcheck'])), 'query subcommand runs and finds the goal');
+  assert(smoke(['status', HOOK_CWD]).length > 0, 'status subcommand produces output');
+  assert(/engine|state|skill/i.test(smoke(['doctor', HOOK_CWD])), 'doctor subcommand reports runtime state');
+  assert(smoke(['coupled', HOOK_CWD, 'src/server.js']) !== undefined, 'coupled subcommand runs without error');
 
   // cleanup
   fs.rmSync(TEST_HOME, { recursive: true, force: true });

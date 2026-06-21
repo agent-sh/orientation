@@ -32,7 +32,9 @@
   "files": [
     "bin/",
     "src/",
-    "skill/",
+    "skills/",
+    "hooks/",
+    ".claude-plugin/",
     "install.js",
     "projects.txt.example",
     "README.md",

@@ -20,10 +20,11 @@ npm run pack:check
 
 ## What To Preserve
 
-- Keep runtime paths centralized in `src/state.js` (do not reintroduce `paths.js` or hardcode user paths).
-- Keep hook installation idempotent and preserve unrelated user hooks.
+- Keep runtime paths centralized and self-locating in `src/state.js` (do not reintroduce `paths.js`, the old `__dirname`-vs-default inference, or hardcoded user paths).
+- Keep hook installation idempotent, preserve unrelated user hooks, and keep the `ORIENTATION_HOOK=1` sentinel on owned hooks.
+- Keep the dual install shape working: marketplace `/plugin install` runs no npm step, so `.claude-plugin/plugin.json`, the auto-discovered `skills/` dir, and `hooks/hooks.json` must stay self-contained.
+- Keep the skill at `skills/get-oriented/SKILL.md` (plural) with frontmatter limited to `name` and `description`.
 - Keep `AGENTS.md` and `CLAUDE.md` byte-for-byte identical.
-- Keep `skill/get-oriented/SKILL.md` frontmatter limited to `name` and `description`.
 - Do not write tests that touch the developer's real `~/.claude`, `~/.codex`, or `~/.eigen` directories.
 
 ## Pull Requests

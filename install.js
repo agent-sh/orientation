@@ -13,7 +13,7 @@ const { spawnSync } = require('child_process');
 
 const PKG = __dirname;
 const SRC = path.join(PKG, 'src');
-const SKILL = path.join(PKG, 'skill', 'get-oriented', 'SKILL.md');
+const SKILL = path.join(PKG, 'skills', 'get-oriented', 'SKILL.md');
 const PROJECTS_EXAMPLE = path.join(PKG, 'projects.txt.example');
 const HOME = os.homedir();
 

@@ -34,8 +34,13 @@ function commandText(command) {
   return typeof command === 'string' ? command : '';
 }
 
+// Owned-hook detection. New hooks carry the explicit ORIENTATION_HOOK=1 sentinel;
+// the env-var assignment markers (always baked in by commands()) keep hooks
+// installed before the sentinel detectable so upgrade/repair stays idempotent.
+// The bare "action-graph" substring is deliberately NOT matched - it would
+// false-claim unrelated user hooks (e.g. my-action-graph-backup.sh).
 function isOrientationCommand(command) {
-  return /(action-graph|ORIENTATION_HOME|ORIENTATION_ENGINE_DIR)/.test(commandText(command));
+  return /ORIENTATION_HOOK=1|ORIENTATION_HOME=|ORIENTATION_ENGINE_DIR=/.test(commandText(command));
 }
 
 function ensureHook(hooks, event, command, extra = {}) {
@@ -58,7 +63,7 @@ function ensureHook(hooks, event, command, extra = {}) {
 }
 
 function commands(home = ORIENTATION_HOME, engine = ENGINE_DIR) {
-  const env = `ORIENTATION_HOME=${shellQuote(home)} ORIENTATION_ENGINE_DIR=${shellQuote(engine)}`;
+  const env = `ORIENTATION_HOOK=1 ORIENTATION_HOME=${shellQuote(home)} ORIENTATION_ENGINE_DIR=${shellQuote(engine)}`;
   return {
     consume: `${env} ${shellQuote(NODE)} ${shellQuote(path.join(engine, 'consume.js'))}`,
     hook: `${env} ${shellQuote(NODE)} ${shellQuote(path.join(engine, 'hook.js'))}`,
@@ -90,7 +95,10 @@ function removeClaude() {
       if (keptHooks.length !== oldHooks.length) changed += oldHooks.length - keptHooks.length;
       if (keptHooks.length) keptGroups.push({ ...grp, hooks: keptHooks });
     }
-    hooks[event] = keptGroups;
+    // Clean inverse of install: drop the event key entirely when nothing is left,
+    // rather than leaving an empty array behind.
+    if (keptGroups.length) hooks[event] = keptGroups;
+    else delete hooks[event];
   }
   settings.hooks = hooks;
   if (changed) writeSettings(settings);
