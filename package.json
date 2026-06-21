@@ -1,11 +1,13 @@
 {
   "name": "@agent-sh/orientation",
   "version": "0.1.0",
-  "description": "Stops AI coding agents from guessing the story of code they didn't write this session. Reconstructs real history (the goal behind code, shipped vs in-flight, coupled files) from Claude Code transcripts, surfaced via the get-oriented skill.",
+  "description": "Stops AI coding agents from guessing the story of code they didn't write this session. Reconstructs real history (the goal behind code, shipped vs in-flight, coupled files) from Codex, Claude Code, and Eigen transcripts, surfaced via the get-oriented skill.",
   "keywords": [
     "agent-history",
     "agent-provenance",
     "claude-code",
+    "codex",
+    "eigen",
     "context",
     "orientation",
     "provenance",
@@ -24,7 +26,8 @@
   "license": "MIT OR Apache-2.0",
   "author": "Avi Fenesh <avifenesh@gmail.com>",
   "bin": {
-    "orientation": "bin/orientation"
+    "orientation": "bin/orientation",
+    "get-oriented": "bin/orientation"
   },
   "files": [
     "bin/",
@@ -39,11 +42,14 @@
     "LICENSE-*"
   ],
   "scripts": {
-    "postinstall": "node install.js",
-    "test": "node test/selftest.js && node test/skill-frontmatter.js && node test/install.js",
+    "postinstall": "node install.js --all",
+    "sync": "node install.js --all",
+    "sync:codex": "node install.js --codex",
+    "sync:claude": "node install.js --claude",
+    "sync:eigen": "node install.js --eigen",
+    "test": "node test/selftest.js && node test/skill-package.test.js",
     "test:self": "node test/selftest.js",
-    "test:skill": "node test/skill-frontmatter.js",
-    "test:install": "node test/install.js",
+    "test:skill": "node test/skill-package.test.js",
     "pack:check": "npm pack --dry-run"
   },
   "engines": {
@@ -51,7 +57,8 @@
   },
   "os": [
     "darwin",
-    "linux"
+    "linux",
+    "win32"
   ],
   "publishConfig": {
     "access": "public"

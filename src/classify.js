@@ -1,7 +1,7 @@
 // action-graph shared classify — used by ingest.js (and consume.js for branch
 // markers). Single source of truth for turning transcript events into records.
 
-function classify(tool, input) {
+function classify(tool, input, result) {
   const i = input || {};
   switch (tool) {
     case 'Edit':
@@ -24,6 +24,8 @@ function classify(tool, input) {
       else if (/\b(pytest|jest|vitest|cargo test|go test|npm test|npm run test)\b/.test(cmd)) kind = 'test';
       else if (/\b(npm run build|cargo build|make|tsc|go build)\b/.test(cmd)) kind = 'build';
       const out = { kind, cmd: cmd.slice(0, 200), reason };
+      const branch = extractBranch(cmd, result);
+      if (branch) { out.gitBranch = branch; out.gitBranchSource = 'transcript'; }
       // commit message points BACKWARD at the goal that just closed — high-value label
       if (kind === 'commit') { const m = commitMsg(cmd); if (m) out.msg = m; }
       return out;
@@ -36,6 +38,23 @@ function classify(tool, input) {
     default:
       return { kind: 'other', tool };
   }
+}
+
+function extractBranch(cmd, result) {
+  const s = result == null ? '' : (typeof result === 'string' ? result : JSON.stringify(result));
+  const text = s.slice(0, 4000);
+  const status = /\bOn branch ([^\n\r]+)/.exec(text);
+  if (status) return status[1].trim();
+  const marker = /---BRANCH---\s*[\r\n]+([^\r\n]+)/.exec(text);
+  if (marker && marker[1].trim() && !marker[1].includes('---')) return marker[1].trim();
+  if (/\bgit\s+branch\s+--show-current\b/.test(cmd)) {
+    const line = text.split(/\r?\n/).map(x => x.trim())
+      .find(x => x && !x.startsWith('---') && !x.startsWith('/') && !/\s/.test(x));
+    if (line) return line;
+  }
+  const sw = /\bgit\s+(?:switch|checkout)\s+(?:-c\s+)?([^\s;&|]+)/.exec(cmd);
+  if (sw && !sw[1].startsWith('-')) return sw[1];
+  return null;
 }
 
 // Pull the subject line from a git commit. Handles the common heredoc form
@@ -71,6 +90,9 @@ function ok(result) {
 // Patterns that look like user text but are system-injected noise, not real intent.
 const INTENT_NOISE = [
   /^<local-command/, /^<command-/, /^<system-remind/, /^<command-name/,
+  /^<environment_context>/, /^<permissions instructions>/, /^<apps_instructions>/,
+  /^<skills_instructions>/, /^<plugins_instructions>/,
+  /^\[Context compacted/i,
   /^This session is being continued/i,
   /^Base directory for this skill/i,
   /^\[Image:/, /^\[Request interrupted/, /^Caveat:/,
@@ -127,4 +149,4 @@ function branchMarker(text) {
   return null;
 }
 
-module.exports = { classify, extractReason, ok, cleanIntent, commitMsg, gistText, branchMarker };
+module.exports = { classify, extractReason, extractBranch, ok, cleanIntent, commitMsg, gistText, branchMarker };

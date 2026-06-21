@@ -8,16 +8,24 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { execFileSync } = require('child_process');
-const crypto = require('crypto');
+const { projectKey } = require('../src/project');
+const { parseRows } = require('../src/adapters');
 
-const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'orientation-selftest-'));
-process.env.ORIENTATION_HOME = path.join(tmp, 'action-graph');
 const AG = path.join(__dirname, '..', 'src'); // engine scripts live in src/ in the repo
-const ROOT = path.join(process.env.ORIENTATION_HOME, 'data');
+const TEST_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'orientation-selftest-'));
+const ROOT = path.join(TEST_HOME, 'data');
 const NODE = process.execPath;
 const FIX_CWD = '/__selftest__/proj';
-const key = crypto.createHash('sha1').update(FIX_CWD).digest('hex').slice(0, 12);
+const key = projectKey(FIX_CWD);
 const dir = path.join(ROOT, key);
+const TEST_ENV = {
+  ...process.env,
+  ORIENTATION_HOME: TEST_HOME,
+  ORIENTATION_ENGINE_DIR: AG,
+  CODEX_HOME: path.join(TEST_HOME, 'codex'),
+  CLAUDE_CONFIG_DIR: path.join(TEST_HOME, 'claude'),
+  EIGEN_HOME: path.join(TEST_HOME, 'eigen'),
+};
 
 let failures = 0;
 function assert(cond, msg) {
@@ -60,8 +68,8 @@ function run() {
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(path.join(dir, 'raw.jsonl'), raw.map(r => JSON.stringify(r)).join('\n') + '\n');
 
-  execFileSync(NODE, [path.join(AG, 'condense.js'), key], { encoding: 'utf8' });
-  execFileSync(NODE, [path.join(AG, 'graph.js'), key], { encoding: 'utf8' });
+  execFileSync(NODE, [path.join(AG, 'condense.js'), key], { encoding: 'utf8', env: TEST_ENV });
+  execFileSync(NODE, [path.join(AG, 'graph.js'), key], { encoding: 'utf8', env: TEST_ENV });
 
   const eps = JSON.parse(fs.readFileSync(path.join(dir, 'episodes.json'), 'utf8')).episodes;
   const graph = JSON.parse(fs.readFileSync(path.join(dir, 'graph.json'), 'utf8'));
@@ -77,15 +85,15 @@ function run() {
   console.log('graph invariants:');
   const rels = graph.edges.reduce((m, e) => (m[e.rel] = (m[e.rel] || 0) + 1, m), {});
   assert((rels.touched || 0) > 0, 'touched edges exist');
-  assert((rels.coupled || 0) > 0, 'coupled edges exist (popup+profile co-edited)');
+  assert((rels.coupled || 0) > 0, 'coupled edges exist (popup+auth co-edited)');
   assert((rels.outcome || 0) > 0, 'outcome edges exist');
-  // popup.js + profile.js co-edited in two non-adjacent goals -> resume edge
+  // popup.js + auth.js co-edited in two non-adjacent goals → resume edge
   const resume = graph.edges.filter(e => e.rel === 'resumes');
-  assert(resume.length >= 1, 'at least one resume edge (popup/profile thread)');
+  assert(resume.length >= 1, 'at least one resume edge (popup/auth thread)');
   assert(resume.every(e => e.weight >= 0.45), 'all resume edges meet cosine floor 0.45');
 
   console.log('consume invariants:');
-  const out = execFileSync(NODE, [path.join(AG, 'consume.js'), FIX_CWD], { encoding: 'utf8' });
+  const out = execFileSync(NODE, [path.join(AG, 'consume.js'), FIX_CWD], { encoding: 'utf8', env: TEST_ENV });
   const ctx = JSON.parse(out).hookSpecificOutput.additionalContext;
   // inject is a thin POINTER, not a data dump: names the skill + goal count, no goal text
   assert(/get-oriented/.test(ctx), 'inject points to the get-oriented skill');
@@ -96,13 +104,41 @@ function run() {
   // Fixture records are all "now" (same timestamp), so recent work must read as
   // IN FLIGHT / deliberate, NEVER abandoned. This is the failure that mislabeled
   // active codex-wrapper-updater work as abandoned.
-  const prov = execFileSync(NODE, [path.join(AG, 'consume.js'), '--provenance', FIX_CWD, 'src/auth.js'], { encoding: 'utf8' });
+  const prov = execFileSync(NODE, [path.join(AG, 'consume.js'), '--provenance', FIX_CWD, 'src/auth.js'], { encoding: 'utf8', env: TEST_ENV });
   assert(/IN FLIGHT|DELIBERATE/.test(prov), 'recent work reads as in-flight/deliberate');
   assert(!/abandoned/i.test(prov) || /not.*abandon|NOT abandoned/i.test(prov), 'recent work is NOT labeled abandoned');
   assert(/Last touched/.test(prov), 'provenance reports recency (the decisive signal)');
 
+  console.log('codex adapter invariants:');
+  const codex = parseRows('codex', [
+    { type: 'session_meta', payload: { id: '01234567-89ab-cdef-0123-456789abcdef', cwd: FIX_CWD } },
+    {
+      timestamp: T,
+      type: 'response_item',
+      payload: {
+        type: 'custom_tool_call',
+        call_id: 'patch-call',
+        name: 'functions.apply_patch',
+        input: '*** Begin Patch\n*** Update File: README.md\n@@\n-old\n+new\n*** End Patch\n',
+      },
+    },
+  ], { source: '/tmp/rollout.jsonl', cwd: FIX_CWD });
+  const patch = codex.find(r => r.kind === 'edit');
+  assert(patch && patch.files.includes('README.md'), 'codex apply_patch input records touched files');
+
+  console.log('install invariants:');
+  execFileSync(NODE, [path.join(__dirname, '..', 'install.js'), '--all', '--no-hooks'], {
+    encoding: 'utf8',
+    env: TEST_ENV,
+  });
+  assert(fs.existsSync(path.join(TEST_ENV.CODEX_HOME, 'skills', 'get-oriented', 'SKILL.md')), 'codex skill installed');
+  assert(fs.existsSync(path.join(TEST_ENV.CLAUDE_CONFIG_DIR, 'skills', 'get-oriented', 'SKILL.md')), 'claude skill installed');
+  assert(fs.existsSync(path.join(TEST_ENV.EIGEN_HOME, 'skills', 'get-oriented', 'SKILL.md')), 'eigen skill installed');
+  assert(fs.existsSync(path.join(TEST_ENV.EIGEN_HOME, 'orientation', 'consume.js')), 'eigen orientation engine installed');
+  assert(fs.existsSync(path.join(TEST_ENV.CLAUDE_CONFIG_DIR, 'action-graph', 'consume.js')), 'claude orientation engine installed');
+
   // cleanup
-  fs.rmSync(tmp, { recursive: true, force: true });
+  fs.rmSync(TEST_HOME, { recursive: true, force: true });
 
   console.log(failures ? `\nFAILED (${failures})` : '\nPASS');
   process.exit(failures ? 1 : 0);

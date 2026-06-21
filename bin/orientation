@@ -1,73 +1,108 @@
 #!/usr/bin/env node
-// orientation CLI — thin wrapper over the installed engine.
-// Subcommands:
-//   orientation install                  (re)install engine, skill, hooks
-//   orientation refresh                  rebuild graphs now (ingest→condense→graph)
-//   orientation provenance <cwd> <file>  history/verdict for a file (delete/judge)
-//   orientation related    <cwd> <file>  prior work + sibling files (before adding)
-//   orientation threads    <cwd>         resume threads (goals rejoined across detours)
-//   orientation coupled    <cwd> <file>  files co-edited with this one
+// orientation CLI. When run from this repo it uses the local src/ engine while
+// reading/writing the dogfood state in ~/.eigen/orientation by default.
 
 const path = require('path');
+const os = require('os');
 const { spawnSync } = require('child_process');
-const { ACTION_GRAPH: AG } = require('../src/paths');
 
+const PKG = path.resolve(__dirname, '..');
+const HOME = os.homedir();
+const EIGEN = process.env.EIGEN_HOME || path.join(HOME, '.eigen');
+const ENGINE = process.env.ORIENTATION_ENGINE_DIR || path.join(PKG, 'src');
+const STATE = process.env.ORIENTATION_HOME
+  || process.env.EIGEN_ORIENTATION_DIR
+  || path.join(EIGEN, 'orientation');
 const NODE = process.execPath;
 const [cmd, ...rest] = process.argv.slice(2);
 
-function finish(result) {
-  if (result.error) {
-    console.error(result.error.message);
-    process.exit(1);
-  }
-  if (result.signal) {
-    console.error(`terminated by ${result.signal}`);
-    process.exit(1);
-  }
-  process.exit(result.status == null ? 1 : result.status);
+function env() {
+  return {
+    ...process.env,
+    ORIENTATION_ENGINE_DIR: ENGINE,
+    ORIENTATION_HOME: STATE,
+  };
 }
 
-function run(file, args) {
-  const r = spawnSync(NODE, [path.join(AG, file), ...args], { stdio: 'inherit' });
-  finish(r);
+function runNode(file, args) {
+  const r = spawnSync(NODE, [path.join(ENGINE, file), ...args], {
+    stdio: 'inherit',
+    env: env(),
+  });
+  process.exit(r.status || 0);
 }
 
-function runLocal(file, args) {
-  const r = spawnSync(NODE, [path.join(__dirname, '..', file), ...args], { stdio: 'inherit' });
-  finish(r);
+function runScript(command, args) {
+  const r = spawnSync(command, args, { stdio: 'inherit', env: env() });
+  process.exit(r.status || 0);
+}
+
+function runInstaller(args) {
+  const r = spawnSync(NODE, [path.join(PKG, 'install.js'), ...args], {
+    stdio: 'inherit',
+    env: env(),
+  });
+  process.exit(r.status || 0);
 }
 
 switch (cmd) {
   case 'install':
-    runLocal('install.js', rest);
+  case 'sync':
+    runInstaller(rest);
     break;
   case 'refresh':
-    finish(spawnSync('bash', [path.join(AG, 'refresh.sh')], { stdio: 'inherit' }));
+    runScript('bash', [path.join(ENGINE, 'refresh.sh'), ...rest]);
     break;
   case 'provenance':
-    run('consume.js', ['--provenance', ...rest]);
+    runNode('consume.js', ['--provenance', ...rest]);
     break;
   case 'related':
-    run('consume.js', ['--related', ...rest]);
+    runNode('consume.js', ['--related', ...rest]);
+    break;
+  case 'query':
+    runNode('consume.js', ['--query', ...rest]);
+    break;
+  case 'sources':
+    runNode('consume.js', ['--sources', ...rest]);
     break;
   case 'threads':
-    run('graph.js', ['--threads', ...rest]);
+    runNode('graph.js', ['--threads', ...rest]);
     break;
   case 'coupled':
-    run('graph.js', ['--coupled', ...rest]);
+    runNode('graph.js', ['--coupled', ...rest]);
+    break;
+  case 'ingest':
+    runNode('ingest.js', rest);
+    break;
+  case 'doctor':
+    runNode('doctor.js', rest);
+    break;
+  case 'status':
+    runNode('status.js', rest);
+    break;
+  case 'projects':
+    runNode('status.js', ['--projects', ...rest]);
+    break;
+  case 'hooks':
+    runNode('hooks.js', rest);
     break;
   default:
-    console.log(`orientation — reconstruct the real history of code from Claude Code transcripts.
+    console.log(`orientation - reconstruct real code history from agent transcripts.
 
 usage:
-  orientation install                  install or repair engine, skill, and hooks
-  orientation refresh                  rebuild graphs now
-  orientation provenance <cwd> <file>  history + verdict (judging/deleting)
-  orientation related    <cwd> <file>  prior work + siblings (before adding)
-  orientation threads    <cwd>         resume threads across detours
-  orientation coupled    <cwd> <file>  files co-edited with this one
+  orientation sync [--all|--codex|--claude|--eigen]  install/sync homes
+  orientation refresh                                rebuild indexes
+  orientation status [cwd]                           show project index state
+  orientation doctor [cwd]                           inspect install/runtime state
+  orientation provenance <cwd> <file>                history + verdict
+  orientation related    <cwd> <file>                prior goals + siblings
+  orientation query      <cwd> <words>               search recorded goals
+  orientation sources    <cwd> <goal-id>             show evidence for a goal
+  orientation threads    <cwd>                       resume threads
+  orientation coupled    <cwd> <file>                co-edited files
+  orientation hooks status|install|repair|remove     hook wiring
 
-The get-oriented skill calls these for you when you're about to judge unfamiliar code.
-Engine + hooks install on \`npm install\`; edit ${path.join(AG, 'projects.txt')} to opt projects in.`);
+engine: ${ENGINE}
+state:  ${STATE}`);
     process.exit(cmd ? 1 : 0);
 }

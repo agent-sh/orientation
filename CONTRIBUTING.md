@@ -20,11 +20,11 @@ npm run pack:check
 
 ## What To Preserve
 
-- Keep runtime paths in `src/paths.js`.
+- Keep runtime paths centralized in `src/state.js` (do not reintroduce `paths.js` or hardcode user paths).
 - Keep hook installation idempotent and preserve unrelated user hooks.
 - Keep `AGENTS.md` and `CLAUDE.md` byte-for-byte identical.
 - Keep `skill/get-oriented/SKILL.md` frontmatter limited to `name` and `description`.
-- Do not write tests that touch the developer's real `~/.claude` directory.
+- Do not write tests that touch the developer's real `~/.claude`, `~/.codex`, or `~/.eigen` directories.
 
 ## Pull Requests
 

@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/agent-sh/orientation/actions/workflows/ci.yml/badge.svg)](https://github.com/agent-sh/orientation/actions/workflows/ci.yml)
 
-orientation reconstructs the real history of code from Claude Code transcripts and exposes it through the `get-oriented` skill, so an agent does not have to guess why unfamiliar code exists.
+orientation reconstructs the real history of code from Codex, Claude Code, and Eigen transcripts and exposes it through the `get-oriented` skill, so an agent does not have to guess why unfamiliar code exists.
 
 It answers the questions that matter before a cleanup, bug call, or nearby change:
 
@@ -19,8 +19,9 @@ This repository is ready for public GitHub use and local installation from GitHu
 
 Current host support:
 
-- Claude Code: installer copies the engine, installs the skill, and wires hooks.
-- Codex and other skill hosts: the `get-oriented` skill frontmatter is linted for portability, but automatic hook installation is currently Claude Code-focused.
+- Claude Code: installer copies the engine, installs the skill, and wires `SessionStart`, `Stop`, and `PreCompact` hooks in `settings.json`.
+- Codex: installer copies the engine and skill; Codex hooks are harness-owned, so the installer prints the hook contract to wire into your harness instead of editing config.
+- Eigen: installer copies the engine and skill and wires the `turn_done`, `session_stop`, and `note` hooks in `hooks.json`.
 
 ## Install
 
@@ -38,21 +39,23 @@ cd orientation
 npm install -g .
 ```
 
-The installer is idempotent. It can be re-run safely:
+The installer is idempotent. It can be re-run safely, and you can target one runtime or all:
 
 ```bash
-orientation install
+orientation sync            # all runtimes (codex + claude + eigen)
+orientation sync --claude   # Claude Code only
+orientation sync --codex    # Codex only
+orientation sync --eigen    # Eigen only
 ```
 
 By default it writes to:
 
-- `~/.claude/action-graph/` for the engine and graph data
-- `~/.claude/skills/get-oriented/SKILL.md` for the skill
-- `~/.claude/settings.json` for Claude Code `SessionStart`, `Stop`, and `PreCompact` hooks
+- `~/.claude/action-graph/` for the Claude engine and graph data, plus `~/.claude/skills/get-oriented/SKILL.md` and hooks in `~/.claude/settings.json`.
+- `~/.eigen/orientation/` for the Codex/Eigen engine and graph data, plus skills under `~/.codex/skills/get-oriented/` and `~/.eigen/skills/get-oriented/` and Eigen hooks in `~/.eigen/hooks.json`.
 
 ## Quick Start
 
-Opt projects into transcript indexing by adding one cwd prefix per line:
+Opt projects into transcript indexing by adding one cwd prefix per line to the engine home's `projects.txt` (`~/.claude/action-graph/projects.txt` for Claude, `~/.eigen/orientation/projects.txt` for Codex/Eigen):
 
 ```bash
 echo "$HOME/projects" >> ~/.claude/action-graph/projects.txt
@@ -76,7 +79,7 @@ Ask for related prior work before adding near a file:
 orientation related "$PWD" src/example.js
 ```
 
-If there are no Claude Code transcripts for the project yet, orientation will say so. That is a useful result: no recorded provenance is not evidence that code is dead.
+If there are no transcripts for the project yet, orientation will say so. That is a useful result: no recorded provenance is not evidence that code is dead.
 
 ## What The Skill Does
 
@@ -97,9 +100,11 @@ The key rule is recency-first:
 ## How It Works
 
 ```text
-~/.claude/projects/**/*.jsonl
+~/.claude/projects/**/*.jsonl   (Claude Code)
+~/.codex/sessions/**/*.jsonl    (Codex)
+~/.eigen/sessions|tasks/**       (Eigen)
         |
-        | ingest.js
+        | ingest.js  (per-runtime adapters)
         v
 raw.jsonl
         |
@@ -130,12 +135,17 @@ This is deliberately file-level. It points the agent at the area and prior goal 
 ## CLI
 
 ```bash
-orientation install
-orientation refresh
-orientation provenance <cwd> <file>
-orientation related <cwd> <file>
-orientation threads <cwd>
-orientation coupled <cwd> <file>
+orientation sync [--all|--codex|--claude|--eigen]   install/sync homes
+orientation refresh                                  rebuild indexes
+orientation status [cwd]                             show project index state
+orientation doctor [cwd]                             inspect install/runtime state
+orientation provenance <cwd> <file>                  history + verdict
+orientation related    <cwd> <file>                  prior goals + siblings
+orientation query      <cwd> <words>                 search recorded goals
+orientation sources    <cwd> <goal-id>               show evidence for a goal
+orientation threads    <cwd>                          resume threads across detours
+orientation coupled    <cwd> <file>                  co-edited files
+orientation hooks status|install|repair|remove       hook wiring
 ```
 
 Examples:
@@ -144,6 +154,7 @@ Examples:
 orientation threads "$PWD"
 orientation coupled "$PWD" src/auth.js
 orientation provenance "$PWD" README.md
+orientation query "$PWD" auth token expiry
 ```
 
 ## Configuration
@@ -152,11 +163,13 @@ Set these before install or before running the CLI:
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `CLAUDE_CONFIG_DIR` | `~/.claude` | Claude Code config directory. |
-| `ORIENTATION_HOME` | `$CLAUDE_CONFIG_DIR/action-graph` | Engine, data, and `projects.txt` location. |
-| `ORIENTATION_PROJECTS_DIR` | `$CLAUDE_CONFIG_DIR/projects` | Claude Code transcript directory. |
-| `ORIENTATION_NODE` | `command -v node` in hooks | Node binary used by `refresh.sh`. |
-| `ORIENTATION_NODE_MAX_OLD_SPACE_SIZE` | `4096` | Heap limit for transcript ingest. |
+| `CLAUDE_CONFIG_DIR` | `~/.claude` | Claude Code config directory (transcripts, skill, hooks). |
+| `CODEX_HOME` | `~/.codex` | Codex config directory (sessions, skill). |
+| `EIGEN_HOME` | `~/.eigen` | Eigen config directory (sessions/tasks, skill, hooks). |
+| `ORIENTATION_HOME` | engine-home-relative (`~/.claude/action-graph` or `~/.eigen/orientation`) | Engine state, data, and `projects.txt` location. |
+| `ORIENTATION_ENGINE_DIR` | same as `ORIENTATION_HOME` | Directory the engine scripts run from. |
+| `EIGEN_ORIENTATION_DIR` | `~/.eigen/orientation` | Codex/Eigen engine home override. |
+| `NODE` | `command -v node` | Node binary used by `refresh.sh`. |
 
 Example isolated install:
 
@@ -176,12 +189,13 @@ npm test
 
 It checks:
 
-- end-to-end ingest, condense, graph, and consume behavior
+- end-to-end condense, graph, and consume behavior
 - recency verdicts so recent uncommitted work is not labeled abandoned
 - resume-thread scoring invariants
+- the Codex `apply_patch` adapter records touched files
+- multi-runtime install into temp Claude/Codex/Eigen homes (never touches your real config)
 - `get-oriented` frontmatter portability, including replaying the old failing `allowed-tools` shape
 - agnix validation for Claude Code and Codex when `agnix` is installed
-- package install behavior in a temporary Claude config
 
 Check the package contents:
 
@@ -192,14 +206,14 @@ npm run pack:check
 ## Limitations
 
 - orientation only sees transcript history that exists locally.
-- The installer currently targets Claude Code's local config and hook schema.
+- Codex hooks are harness-owned: the installer prints the hook contract rather than editing Codex config for you.
 - Results are file-level, not symbol-level.
-- Concurrent sessions can be behind until `Stop`, `PreCompact`, or a manual `orientation refresh`.
+- Concurrent sessions can be behind until a session-end hook fires or a manual `orientation refresh`.
 - Skill activation is model-mediated. The hook injects a pointer; the model still chooses when to use the skill.
 
 ## Security And Privacy
 
-orientation reads local Claude Code transcript JSONL and writes derived graph data locally. It does not send transcript contents, source code, prompts, or graph data to a remote service.
+orientation reads local Codex, Claude Code, and Eigen transcript JSONL and writes derived graph data locally. It does not send transcript contents, source code, prompts, or graph data to a remote service.
 
 The generated data can include prompt snippets, file paths, command names, and commit messages. Treat `~/.claude/action-graph/data/` as local developer data and do not commit it.
 
